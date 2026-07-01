@@ -1,0 +1,6 @@
+interface:
+  display_name: "Django Multi-Tenant Production"
+  short_description: "Evaluate, validate, build, and repair production Django multi-tenant SaaS apps."
+  default_prompt: "Use the django-multitenant-production skill to evaluate tenant isolation, auth, migrations, async jobs, cache, storage, and tests."
+policy:
+  allow_implicit_invocation: true

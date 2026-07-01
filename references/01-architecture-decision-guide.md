@@ -1,0 +1,118 @@
+# Architecture Decision Guide
+
+Use this guide before writing code. Multi-tenancy is an architecture decision, not a package-selection decision.
+
+## Required inputs
+
+Capture these facts in the ADR:
+
+- number of tenants expected now, at 12 months, and at 36 months
+- tenant data volume and largest-tenant skew
+- regulatory/compliance requirements
+- custom domain requirement
+- user model: one account per tenant, or one global user across many tenants
+- reporting requirements: per-tenant only, cross-tenant analytics, admin/global dashboards
+- backup/restore needs: all tenants together, individual tenant point-in-time restore, legal hold
+- data residency or per-tenant encryption needs
+- expected background jobs and imports/exports
+- API exposure and third-party integrations
+- support/admin impersonation requirements
+- operational team size and database expertise
+
+## Decision matrix
+
+| Model | Best when | Strengths | Costs/Risks | Default verdict |
+|---|---|---|---|---|
+| Database per tenant | enterprise isolation, regulated data, few tenants, custom DB maintenance | strongest isolation, simple restore, per-tenant DB tuning | expensive ops, many connections, migrations across DBs | Use for high-compliance tiers |
+| Schema per tenant | B2B SaaS on PostgreSQL, moderate tenant count, custom domains, per-tenant restore | good isolation, one DB, familiar Django code with `django-tenants` | schema migrations across tenants, cross-tenant analytics complexity | Recommended default |
+| Shared schema with tenant key | high tenant count, low isolation needs, Citus/distributed Postgres, cheaper ops | simple migrations, efficient common schema, easier analytics | cross-tenant leak risk if filters fail, all code must be tenant-aware | Use only with strong guardrails |
+| Hybrid | different enterprise tiers or regulatory classes | right isolation per customer tier | complex ops and testing matrix | Use intentionally, not accidentally |
+| Deployment per tenant | bespoke enterprise, on-prem, private cloud | strongest app/runtime isolation | high cost, version sprawl | Use for strategic accounts only |
+
+## Production default
+
+For new Django SaaS on PostgreSQL, use schema-per-tenant with `django-tenants` unless facts justify shared schema or stronger isolation.
+
+Add `django-tenant-users` if one human identity must access multiple tenants with different roles/permissions.
+
+Use shared-schema only when the team commits to strict tenant-aware query patterns, tests, and database constraints.
+
+## Tenant identity resolution
+
+Choose one primary tenant locator and document it.
+
+### Subdomain or custom domain
+
+Examples: `acme.example.com`, `app.acme.com`.
+
+Good for B2B SaaS and `django-tenants` because domain maps naturally to tenant/schema.
+
+Requirements:
+
+- tenant/domain table in public schema
+- verified custom domain ownership flow
+- primary domain flag
+- protection against dangling domains and takeover
+- canonical redirects where appropriate
+- local development domain strategy such as `.localhost`
+
+### Path prefix
+
+Example: `example.com/t/acme/`.
+
+Use when subdomains are unavailable. Be stricter with URL reversing, middleware, static files, and public/tenant URL separation.
+
+### Session/workspace switcher
+
+Example: user logs in and selects active organization.
+
+Good for global users across many tenants. Validate selected tenant against membership on every switch and before storing active tenant in session.
+
+### Token claim
+
+Use in APIs only if the tenant claim is issued by a trusted identity provider or your backend and is validated against current membership. Never trust raw `X-Tenant-ID` headers from clients.
+
+## Shared schema guardrails
+
+Shared schema must include:
+
+- tenant FK/tenant ID on every tenant-owned table
+- tenant-aware managers/querysets
+- tenant-scoped unique constraints
+- tenant-aware foreign keys or composite constraints where feasible
+- query tests for list, retrieve, update, delete, bulk actions, exports
+- admin restrictions
+- no raw global `objects` manager usage in application code
+- optional PostgreSQL row-level security for high-risk data
+
+## Schema-per-tenant guardrails
+
+Schema-per-tenant must include:
+
+- `django_tenants.postgresql_backend`
+- tenant middleware at the top of middleware
+- `TenantSyncRouter`
+- tenant and domain models inheriting the correct mixins
+- correct `SHARED_APPS`, `TENANT_APPS`, `INSTALLED_APPS`
+- `TENANT_MODEL`, `TENANT_DOMAIN_MODEL`
+- tenant migration workflow
+- tenant-aware cache/file/logging behavior
+- explicit task/command tenant context
+- tests using `TenantTestCase`, `TenantClient`, `schema_context`, or `tenant_context`
+
+## ADR questions
+
+Answer these in the ADR:
+
+1. What is the chosen tenancy model?
+2. What alternatives were rejected and why?
+3. How is tenant context resolved?
+4. How does auth bind users to tenants?
+5. How are permissions scoped per tenant?
+6. How are migrations run safely?
+7. How are background jobs scoped?
+8. How are cache/session/storage keys isolated?
+9. How is tenant offboarding handled?
+10. How are cross-tenant admin/support workflows controlled and audited?
+11. What tests prove isolation?
+12. What operational runbooks are required?
