@@ -44,6 +44,10 @@ def write_file(path: Path, content: str, *, force: bool) -> bool:
 
 def build_files(app: str, tenant_model: str, domain_model: str) -> dict[str, str]:
     app_config_name = "".join(part.capitalize() for part in app.split(".")) + "Config"
+    # Django derives the app label from the last dotted segment of the app path, so a
+    # dotted --app (e.g. platform.tenants) has label "tenants". TENANT_MODEL/
+    # TENANT_DOMAIN_MODEL must be "<app_label>.<ModelName>", never the full dotted path.
+    app_label = app.split(".")[-1]
     tenant_var = snake_case(tenant_model)
 
     files: dict[str, str] = {}
@@ -132,8 +136,9 @@ def build_files(app: str, tenant_model: str, domain_model: str) -> dict[str, str
     files["management/__init__.py"] = ""
     files["management/commands/__init__.py"] = ""
     files["management/commands/provision_tenant.py"] = dedent(f'''
+        import re
+
         from django.core.management.base import BaseCommand, CommandError
-        from django.db import transaction
 
         from {app}.models import {domain_model}, {tenant_model}
 
@@ -148,9 +153,17 @@ def build_files(app: str, tenant_model: str, domain_model: str) -> dict[str, str
                 parser.add_argument("--slug", help="Public slug. Defaults to schema.")
                 parser.add_argument("--active", action="store_true", help="Mark tenant active immediately.")
 
-            @transaction.atomic
             def handle(self, *args, **options):
+                # No @transaction.atomic here: with auto_create_schema=True, saving the
+                # tenant creates the schema and runs its migrations outside this
+                # transaction, so wrapping handle() conflicts with it (and migrations
+                # using CREATE INDEX CONCURRENTLY cannot run inside a transaction block).
                 schema_name = options["schema"].strip().lower()
+                if not re.fullmatch(r"[a-z_][a-z0-9_]*", schema_name) or schema_name.startswith("pg_"):
+                    raise CommandError(
+                        f"Invalid schema name {{schema_name!r}}: must match "
+                        "^[a-z_][a-z0-9_]*$ and must not start with 'pg_'."
+                    )
                 domain_name = options["domain"].strip().lower().removeprefix("http://").removeprefix("https://").rstrip("/")
                 slug = options.get("slug") or schema_name
 
@@ -244,8 +257,8 @@ def build_files(app: str, tenant_model: str, domain_model: str) -> dict[str, str
 
         INSTALLED_APPS = list(SHARED_APPS) + [app for app in TENANT_APPS if app not in SHARED_APPS]
 
-        TENANT_MODEL = "{app}.{tenant_model}"
-        TENANT_DOMAIN_MODEL = "{app}.{domain_model}"
+        TENANT_MODEL = "{app_label}.{tenant_model}"
+        TENANT_DOMAIN_MODEL = "{app_label}.{domain_model}"
 
         # Optional but recommended for tenant-specific cache data:
         # CACHES["default"]["KEY_FUNCTION"] = "django_tenants.cache.make_key"
@@ -258,7 +271,7 @@ def build_files(app: str, tenant_model: str, domain_model: str) -> dict[str, str
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Create a conservative django-tenants app scaffold.")
     parser.add_argument("--root", default=".", help="Django project root. Default: current directory.")
-    parser.add_argument("--app", default="customers", help="Python app path to create, e.g. customers or platform.tenants.")
+    parser.add_argument("--app", default="customers", help="Python app path to create, e.g. customers or apps.tenants.")
     parser.add_argument("--tenant-model", default="Client", help="Tenant model class name. Default: Client.")
     parser.add_argument("--domain-model", default="Domain", help="Domain model class name. Default: Domain.")
     parser.add_argument("--force", action="store_true", help="Overwrite existing files.")

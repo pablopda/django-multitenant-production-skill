@@ -1,6 +1,6 @@
 # Django Multi-Tenant Production Skill
 
-A production-grade [Agent Skill](https://docs.anthropic.com/en/docs/claude-code/skills) for **evaluating, validating, building, repairing, and migrating Django multi-tenant SaaS applications** — with tenant isolation treated as an explicit, tested, observable, and hard-to-bypass property.
+A production-grade [Agent Skill](https://code.claude.com/docs/en/skills) for **evaluating, validating, building, repairing, and migrating Django multi-tenant SaaS applications** — with tenant isolation treated as an explicit, tested, observable, and hard-to-bypass property.
 
 It ships as a portable skill directory (`SKILL.md` + `references/` + `templates/` + `scripts/`) that works with both **Claude Code** (`.claude/skills/`) and **Codex / OpenAI agents** (`.agents/skills/`).
 
@@ -65,16 +65,34 @@ django-multitenant-production-skill/
 
 ---
 
+## Compatibility
+
+The playbooks and scripts were written and validated against these baselines (see `references/99-sources-and-current-baseline.md`):
+
+| Component | Baseline version | Notes |
+|---|---|---|
+| Django | 5.2 LTS (default) / 6.0.x | 5.2 LTS is the conservative default (supported through April 2028); use 6.0.x when the project already targets Django 6. |
+| `django-tenants` | 3.10.1 | Schema-per-tenant isolation. |
+| `django-tenant-users` | 2.2.1 | Global users with per-tenant permissions. |
+| `django-multitenant` | 4.1.1 | Shared-schema (`tenant_id` / Citus). |
+| Python | 3.10+ | Bundled scripts are standard-library only. |
+| PostgreSQL | Required | Schema-per-tenant relies on PostgreSQL schemas; shared-schema RLS is PostgreSQL-specific. |
+
+The skill re-checks your project's pinned versions before implementing; this table is the tested baseline as of **2026-06-09**.
+
+---
+
 ## Install
 
 ### Claude Code
 
-**Per project** (available in that repo only):
+**Per project** (available in that repo only) — clone to a temp path so no stray checkout or `.git/` is left in the repo:
 
 ```bash
-git clone https://github.com/pablopda/django-multitenant-production-skill.git
+git clone --depth 1 https://github.com/pablopda/django-multitenant-production-skill.git /tmp/dmtp
 mkdir -p .claude/skills
-cp -R django-multitenant-production-skill .claude/skills/django-multitenant-production
+cp -R /tmp/dmtp .claude/skills/django-multitenant-production
+rm -rf /tmp/dmtp .claude/skills/django-multitenant-production/.git
 ```
 
 **Globally** (available in every session) — symlink so the checkout stays the single editable source:
@@ -92,28 +110,42 @@ Restart Claude Code so it picks up the new skill.
 Same layout under `.agents/skills/` (per repo) or `~/.agents/skills/` (global):
 
 ```bash
+git clone https://github.com/pablopda/django-multitenant-production-skill.git ~/skills/django-multitenant-production-skill
 mkdir -p ~/.agents/skills
 ln -s ~/skills/django-multitenant-production-skill ~/.agents/skills/django-multitenant-production
 ```
 
 > The skill's internal name is `django-multitenant-production` (from `SKILL.md` frontmatter). Name the installed directory to match.
 
+### Verify the install
+
+- **Claude Code**: type `/` and confirm `django-multitenant-production` appears in the list, or ask "what skills are available?".
+- **Codex**: run `/skills` and confirm it is listed.
+
+`SKILL.md` must sit **directly** at `.claude/skills/django-multitenant-production/SKILL.md` (or the `.agents/skills/...` equivalent). One extra nesting level — e.g. `.claude/skills/django-multitenant-production/django-multitenant-production-skill/SKILL.md`, which happens if you copy the repo folder *inside* the skill folder — makes the skill fail to load silently.
+
 ---
 
 ## Use it
 
-It **auto-triggers** when a task matches its description (Django multi-tenant / tenant isolation / `django-tenants` / `django-tenant-users` / `django-multitenant` / B2B SaaS evaluate·validate·migrate·build). You can also invoke it explicitly:
+It **auto-triggers** when a task matches its description (Django multi-tenant / multitenancy / tenant isolation / `django-tenants` / `django-tenant-users` / `django-multitenant` / schema-per-tenant / shared-schema `tenant_id` / B2B SaaS evaluate·validate·migrate·build). A plain natural-language mention works in **either runtime**:
 
 ```text
 Use the django-multitenant-production skill to evaluate this Django SaaS app for tenant isolation risks.
 ```
 
+You can also invoke it explicitly. The explicit-mention syntax differs per runtime:
+
+**Claude Code** — slash form:
+
 ```text
 /django-multitenant-production validate our django-tenants setup and propose production fixes.
 ```
 
+**Codex** — `$` mention (or pick it from the `/skills` list):
+
 ```text
-Use django-multitenant-production to build a schema-per-tenant Django app with global users and per-tenant permissions.
+$django-multitenant-production validate our django-tenants setup and propose production fixes.
 ```
 
 ---
@@ -163,6 +195,12 @@ Both scaffolders write starting points, not finished work — read and adapt the
 ## Baseline & currency
 
 As of **2026-06-09**, the skill treats **Django 5.2 LTS** as the conservative default for new production SaaS projects (supported through April 2028), unless the repository already standardizes on Django 6.x. The skill always re-checks project dependencies and current package docs before implementing. See `references/99-sources-and-current-baseline.md`.
+
+---
+
+## Versioning
+
+Changes are tracked in [CHANGELOG.md](./CHANGELOG.md) (Keep a Changelog format). The currency baseline lives in `references/99-sources-and-current-baseline.md`; its baseline date (currently **2026-06-09**) is bumped whenever the tested package versions change, and the compatibility table above and the changelog move with it.
 
 ---
 

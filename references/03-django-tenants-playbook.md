@@ -57,9 +57,20 @@ INSTALLED_APPS = list(SHARED_APPS) + [
 
 TENANT_MODEL = "customers.Client"
 TENANT_DOMAIN_MODEL = "customers.Domain"
+
+ROOT_URLCONF = "myproject.urls"                    # tenant URLs
+PUBLIC_SCHEMA_URLCONF = "myproject.urls_public"    # public/marketing/signup URLs
 ```
 
 Review whether auth/admin should live in public, tenant schemas, or both. Do not blindly copy app lists.
+
+### Hostname resolution and the public schema
+
+`TenantMainMiddleware` maps the request hostname to a `Domain` row:
+
+- On a hostname with no matching `Domain` it raises `Http404` (via `TENANT_NOT_FOUND_EXCEPTION`). Set `SHOW_PUBLIC_IF_NO_TENANT_FOUND = True` to fall back to the public schema instead of 404 — useful for a shared marketing/signup site, but it is a fail-*open* fallback, so keep the public urlconf minimal.
+- On the public schema the middleware swaps `request.urlconf` to `PUBLIC_SCHEMA_URLCONF`; the tenant urlconf stays in `ROOT_URLCONF`. Without `PUBLIC_SCHEMA_URLCONF` the public schema serves the tenant URLs — a common mistake that exposes tenant routes on the marketing domain.
+- For path-based tenancy instead of hostnames, use `django_tenants.middleware.TenantSubfolderMiddleware` with `TENANT_SUBFOLDER_PREFIX` (e.g. `example.com/t/acme/`); it resolves the tenant from the first path segment rather than the host.
 
 ## Tenant and domain models
 
@@ -131,6 +142,14 @@ Production migration checklist:
 - throttle or parallelize carefully to avoid exhausting DB connections
 - define backout plan before deploy
 
+## Connection pooling
+
+`django-tenants` isolation is entirely `SET search_path` session state set by the middleware/context managers on the Django connection. That makes pooler mode a correctness issue, not just a performance one:
+
+- **Session-mode pooling** (or no external pooler at all, relying on Django `CONN_MAX_AGE` persistent connections) is required.
+- **Transaction- or statement-mode PgBouncer is unsafe**: the pooler multiplexes server connections mid-session, so a query can execute with another tenant's `search_path` — silent cross-tenant leakage. This is the number-one production burn for schema-per-tenant.
+- If transaction-mode PgBouncer is mandatory for other services, give Django its own session-mode pool (or a direct connection), or move off `search_path`-based isolation. The middleware sets the schema once per request; do not assume it re-asserts it per pooled transaction.
+
 ## Request-time code
 
 Schema-per-tenant design reduces the need for explicit tenant filters in normal tenant apps, but code still must be context-safe.
@@ -183,13 +202,29 @@ cache.set(f"tenant:{connection.schema_name}:dashboard_stats", stats)
 
 ## Files/media/static/templates
 
-Use tenant-aware media paths for tenant-owned uploads:
+Prefer `django-tenants`' built-in tenant-aware storage over hand-rolled paths.
+
+Media and static — point storage at the tenant-aware backends, which prefix each schema's files:
 
 ```python
+# settings.py
+STORAGES = {
+    "default": {"BACKEND": "django_tenants.files.storage.TenantFileSystemStorage"},
+    "staticfiles": {"BACKEND": "django_tenants.staticfiles.storage.TenantStaticFilesStorage"},
+}
+MULTITENANT_RELATIVE_MEDIA_ROOT = "%s"    # "%s" is replaced by the schema name
+MULTITENANT_RELATIVE_STATIC_ROOT = "%s"
+```
+
+Collect per-tenant static files with the `collectstatic_schemas` command. For per-tenant templates, use `django_tenants.template.loaders.filesystem`/`cached` with `MULTITENANT_TEMPLATE_DIRS`.
+
+For object storage (S3/GCS), where the built-in filesystem storage does not apply, derive a tenant-prefixed key from the active schema — but only inside a request or `tenant_context`, so `schema_name` is never `public`:
+
+```python
+from django.db import connection
+
 def tenant_upload_to(instance, filename):
-    tenant = getattr(instance, "tenant", None) or getattr(instance, "_tenant", None)
-    # For schema-per-tenant, derive safely from request-time context or stored tenant metadata.
-    return f"tenants/{connection.schema_name}/{instance.__class__.__name__.lower()}/{filename}"
+    return f"tenants/{connection.schema_name}/{instance._meta.model_name}/{filename}"
 ```
 
 Ensure file downloads are authorized against tenant context before returning storage URLs.
@@ -236,4 +271,6 @@ Minimum negative tests:
 - tenant deletion drops schema unexpectedly
 - Celery tasks run in public schema
 - admin exposes public/global tables to tenant staff
+- transaction-mode PgBouncer resets/reuses `search_path` across tenants (see Connection pooling)
+- serving tenant URLs on the public schema because `PUBLIC_SCHEMA_URLCONF` is unset
 - tests use only one tenant/schema

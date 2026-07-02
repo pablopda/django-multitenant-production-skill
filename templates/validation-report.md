@@ -25,6 +25,8 @@ Verdict: Ready | Conditionally ready | Not ready
 
 ## Scorecard
 
+Score each domain 0-3: `0` = absent or unsafe, `1` = partial with high-risk gaps, `2` = mostly implemented with some gaps, `3` = production-ready evidence present. A `0` in tenant context, data isolation, auth, or tests means not production-ready. Full rubric: `references/02-evaluation-scorecard.md`.
+
 | Domain | Score 0-3 | Evidence | Notes |
 |---|---:|---|---|
 | Architecture and tenancy model | | | |

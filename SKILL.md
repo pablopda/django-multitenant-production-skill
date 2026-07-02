@@ -1,7 +1,8 @@
 ---
 name: django-multitenant-production
-scope: Evaluate, validate, design, build, refactor, migrate, and secure production Django multi-tenant SaaS applications.
-description: Use for Django multi-tenant SaaS apps, tenant isolation, django-tenants, django-tenant-users, django-multitenant, organizations, workspaces, account-scoped apps, B2B SaaS evaluation, validation, migration, and production build tasks.
+description: Production playbooks, isolation tests, and scaffolds for Django multi-tenant SaaS. Use to evaluate, validate, design, build, repair, refactor, secure, or migrate multi-tenancy/multitenancy in Django — tenant isolation, django-tenants, django-tenant-users, django-multitenant, schema-per-tenant or shared-schema (tenant_id / row-level scoping / Citus) designs, organizations, workspaces, accounts, account-scoped apps, or converting a single-tenant Django app to multi-tenant. Reach for it whenever a Django app serves multiple tenants and you need production-grade, tested isolation or a B2B SaaS readiness review.
+metadata:
+  version: 1.1.0
 ---
 
 # Django Multi-Tenant Production Skill
@@ -49,6 +50,7 @@ Treat violations as release blockers unless the user explicitly asks for a proto
 8. Do not use `migrate` casually in schema-per-tenant projects. Use the project’s tenant migration flow, normally `migrate_schemas` for `django-tenants`.
 9. Do not approve code unless there are tests proving tenant A cannot read, mutate, list, export, cache-poison, or delete tenant B’s data.
 10. Do not silently introduce global superuser/admin behavior across tenants. Public schema admin, tenant admin, staff flags, object permissions, and support impersonation must be intentionally designed.
+11. Do not run schema-per-tenant Django connections through a transaction- or statement-pooling PgBouncer. `django-tenants` isolates tenants with per-session `SET search_path`; a pooler that multiplexes server connections mid-session resets or reuses that state and silently runs queries against the wrong schema. Require session-mode pooling (or no external pooler, relying on `CONN_MAX_AGE`) for Django connections.
 
 ## First response behavior
 
@@ -75,6 +77,7 @@ Use this when asked to review an existing app or architecture.
    - unknown/mixed
 3. Inspect critical surfaces:
    - settings and middleware order
+   - connection pooling: PgBouncer/pooler mode and `CONN_MAX_AGE` (transaction/statement pooling breaks schema-per-tenant `search_path` isolation)
    - tenant/domain models
    - app separation: shared vs tenant apps
    - models and managers
@@ -129,7 +132,7 @@ A production-ready multi-tenant Django change must pass these gates:
 - **API gate**: list/retrieve/update/delete/export endpoints cannot cross tenants.
 - **Admin gate**: Django admin cannot browse or mutate another tenant accidentally.
 - **Async gate**: Celery/tasks/commands/signals run with explicit tenant context.
-- **Cache/session gate**: cache keys, sessions, throttles, and rate limits are tenant-aware where needed.
+- **Cache/session gate**: cache keys, sessions, throttles, and rate limits are tenant-aware where needed; sessions are bound to their tenant — no wildcard `SESSION_COOKIE_DOMAIN` across tenant subdomains, and the session store lives in the same scope (`SHARED_APPS` vs `TENANT_APPS`) as the user table.
 - **File gate**: media/blob/static handling cannot leak or overwrite cross-tenant data.
 - **Migration gate**: tenant migrations have rollback/backout notes and are tested on multiple tenants.
 - **Observability gate**: logs/audit events include tenant identifier without leaking secrets.
@@ -146,12 +149,13 @@ Use these severities in reports:
 
 ## Code-review heuristics
 
-Flag these patterns aggressively:
+ORM-lookup heuristics depend on the tenancy model, so qualify them before flagging. In **shared-schema** designs a bare `objects` query returns every tenant's rows, so flag it anywhere a tenant is expected. In **schema-per-tenant** (`django-tenants`) the same query is idiomatic and safe once `TenantMainMiddleware` has set the `search_path` — there is no tenant FK to filter on — so flag it only in code that can run *outside* a tenant request: Celery tasks, management commands, migrations, signals, public/shared-app code, or anything before the middleware. Flagging idiomatic tenant-request queries in a `django-tenants` app floods the report with false positives and tempts "fixes" that add a nonexistent tenant field.
 
-- `Model.objects.get(pk=...)` in views, serializers, permissions, GraphQL resolvers, admin actions, tasks, or commands without tenant scoping.
-- `.objects.all()` used for tenant-owned models in APIs, admin, exports, or background jobs.
-- `get_object_or_404(Model, pk=...)` without tenant filter in shared-schema designs.
-- DRF `queryset = Model.objects.all()` for tenant-owned models without overriding `get_queryset`.
+Flag these patterns, applying that qualification to the ORM lookups:
+
+- `Model.objects.get(pk=...)` / `.filter(...)` / `.all()` for tenant-owned models: always in shared-schema; in schema-per-tenant only in code that runs outside tenant-request context (tasks, commands, migrations, signals, shared-app or pre-middleware code).
+- `get_object_or_404(Model, pk=...)` without a tenant filter in shared-schema designs.
+- DRF `queryset = Model.objects.all()` for tenant-owned models without overriding `get_queryset` — same shared-schema/schema-per-tenant distinction as above.
 - cache operations with static keys such as `dashboard_stats`, `user_permissions`, `settings`, `plan`, `usage`, or `limits`.
 - `upload_to="..."` for tenant-owned files without a tenant/schema prefix.
 - Celery tasks accepting only object IDs without tenant ID/schema or without `tenant_context`/`schema_context`.
@@ -194,6 +198,16 @@ For builds, produce:
 - Production operations: `references/08-production-operations-runbook.md`
 - Migration from single tenant: `references/09-migration-playbook.md`
 - Anti-patterns and review prompts: `references/10-anti-patterns.md`
+- Version baseline and sources: `references/99-sources-and-current-baseline.md`
+
+## Scripts and templates
+
+Bundled tooling lives under this skill's `scripts/` and `templates/` directories. Paths are relative to the skill directory, not the target project.
+
+- **Evaluate** — `scripts/tenant_static_audit.py`: AST/regex audit for tenant-isolation smells. `--root <project_root>` selects the project to scan (not the skill dir); `--format json` for machine output; `--fail-on <Critical|High|Medium|Low|Info>` exits non-zero for CI gating.
+- **Validate** — `scripts/generate_tenant_isolation_tests.py`: emits a cross-tenant negative-test skeleton. `--mode schema|shared` (required) picks the template; `--output <path>` and `--force` control the target file. Treat generated tests as scaffolds to complete, not proof.
+- **Build** — `scripts/scaffold_django_tenants_app.py`: scaffolds a `django-tenants` tenant/domain app and provisioning command. `--app`, `--tenant-model`, `--domain-model`, `--force`; run with the project root as `--root`.
+- **Report/plan templates** — `templates/validation-report.md`, `templates/adr-tenancy-decision.md`, `templates/implementation-plan.md`, and the two isolation-test templates.
 
 ## Completion standard
 

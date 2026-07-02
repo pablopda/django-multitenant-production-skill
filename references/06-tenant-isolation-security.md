@@ -50,6 +50,7 @@ Use this as a security review checklist. Cross-tenant leakage is a critical clas
 - Cache keys for tenant data include tenant/schema.
 - Permission/feature-flag caches are tenant-scoped.
 - Session active tenant is validated and refreshed after membership changes.
+- Session store and the user table live in the same scope (both `SHARED_APPS` or both `TENANT_APPS`), and `SESSION_COOKIE_DOMAIN` does not span tenant subdomains — otherwise a session's `user_id` PK can resolve to a different tenant's user.
 - CDN/cache headers do not expose tenant-specific data publicly.
 - Global cache entries are intentionally public and documented.
 

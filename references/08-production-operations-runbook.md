@@ -104,6 +104,7 @@ For suspected cross-tenant leak:
 
 Schema-per-tenant:
 
+- **connection pooler mode is a correctness constraint, not a tuning knob:** `SET search_path` isolation requires session-mode pooling (or no external pooler, relying on `CONN_MAX_AGE`). Transaction- or statement-mode PgBouncer can run queries under the wrong tenant's schema — silent cross-tenant leakage. Verify pooler mode before every deploy (see references/03).
 - many schemas can slow migrations and introspection
 - search path updates can add overhead
 - connection pool and migration parallelism need limits

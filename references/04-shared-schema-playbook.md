@@ -170,11 +170,18 @@ For every tenant-owned model exposed by API/admin:
 
 ## `django-multitenant` notes
 
-When using `django-multitenant`, verify:
+`django-multitenant` (the Citus helper) adds an implicit tenant filter to the ORM based on a thread/async-local "current tenant". Concrete API to look for and use:
 
-- tenant column is present on tenant-owned models
-- models use package mixins/classes consistently
-- tenant context is set before queries
-- migrations include tenant/composite constraints as required
-- DRF integration is reviewed, not assumed
-- Citus/distributed tables are planned if scale-out is a goal
+- Models subclass `django_multitenant.models.TenantModel` and declare `tenant_id = "account_id"` — the name of the tenant column/FK on that model. `TenantManager` (`.objects`) then auto-injects `WHERE account_id = <current tenant>` on `get_queryset` whenever a current tenant is set. Mixin form: `django_multitenant.mixins.TenantModelMixin` / `TenantManagerMixin`.
+- Foreign keys between tenant-owned models use `django_multitenant.fields.TenantForeignKey` (and `TenantOneToOneField`) so joins carry the tenant column — required for Citus colocation and composite references.
+- Request/task code brackets its work with `set_current_tenant(tenant)` ... `unset_current_tenant()` from `django_multitenant.utils`; `get_current_tenant()` reads it back.
+- **Fail-open default:** with no current tenant set, `TenantManager` returns ALL rows across tenants — it does not raise. Any path that forgets `set_current_tenant` silently leaks, so tests must cover the no-context case explicitly.
+- Still verify migrations include the tenant/composite constraints, review (do not assume) DRF integration, and plan Citus/distributed tables if scale-out is a goal.
+
+### Middleware caveat
+
+Do not adopt the shipped `django_multitenant.middlewares.MultitenantMiddleware` as-is. In 4.1.1 it calls `set_current_tenant()` only for authenticated users and never unsets it after the response. Because the current tenant lives in a thread-local/asgiref `Local`, a later anonymous request — or a different tenant's request — handled by the same thread/worker inherits the previous request's tenant: exactly the cross-request leak the middleware section above warns about. Instead:
+
+- Set the current tenant in a custom middleware that wraps the view call in `try/finally` and calls `unset_current_tenant()` in the `finally`.
+- Unset in Celery task teardown too (`task_postrun` or a `finally` block), not just in the web tier.
+- Add a negative test: an anonymous (or tenant-B) request after a tenant-A request on the same worker sees no leftover tenant context.

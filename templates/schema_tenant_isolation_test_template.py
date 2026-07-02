@@ -1,6 +1,10 @@
 """
 Starter tests for schema-per-tenant Django apps using django-tenants.
 Adapt model imports, URLs, and factories before committing.
+
+Every test below fails on purpose until you implement it, so an unfinished
+isolation test can never be mistaken for a passing one. Replace each
+self.fail(...) guard with real assertions.
 """
 
 from django.urls import reverse
@@ -16,18 +20,30 @@ class TenantIsolationTests(TenantTestCase):
     def setUp(self):
         super().setUp()
         self.client_a = TenantClient(self.tenant)
-        # TODO: create tenant_b and seed data with tenant_context(tenant_b)
+        # TODO: create tenant_b and seed data with tenant_context(tenant_b), e.g.:
+        #   with tenant_context(self.tenant_b):
+        #       Project.objects.create(name="tenant B project")
 
     def test_list_endpoint_does_not_include_other_tenant_data(self):
-        # TODO: create data in tenant A and tenant B, then assert tenant A response excludes tenant B data.
-        response = self.client_a.get(reverse("TODO-list-url-name"))
-        assert response.status_code == 200
-        assert "TODO-other-tenant-marker" not in response.content.decode()
+        self.fail("TODO: wire real fixtures/URLs/models, then delete this line.")
+        # Reference shape once implemented (uncomment `from app.models import Project`
+        # and create self.tenant_b in setUp first):
+        with tenant_context(self.tenant):
+            project_a = Project.objects.create(name="tenant A project")
+        with tenant_context(self.tenant_b):
+            project_b = Project.objects.create(name="tenant B project")
+        response = self.client_a.get(reverse("your-list-url-name"))
+        self.assertEqual(response.status_code, 200)
+        # Compare id sets, not substrings: substring checks on stringified JSON are
+        # both flaky (small ids appear inside timestamps) and vacuously passable.
+        ids = {row["id"] for row in response.json()["results"]}
+        self.assertIn(project_a.id, ids)
+        self.assertNotIn(project_b.id, ids)
 
     def test_retrieve_other_tenant_object_denied(self):
-        # TODO: request tenant B object ID from tenant A client and assert 403 or 404.
-        pass
+        self.fail("TODO: request a tenant B object id from the tenant A client and "
+                  "assert the response status is 403 or 404.")
 
     def test_background_task_uses_tenant_context(self):
-        # TODO: call task with tenant A and assert tenant B data unchanged.
-        pass
+        self.fail("TODO: run the background task for tenant A and assert tenant B data "
+                  "is unchanged (the task must enter tenant_context, never trust a bare id).")

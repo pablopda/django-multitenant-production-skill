@@ -37,6 +37,16 @@ Add `django-tenant-users` if one human identity must access multiple tenants wit
 
 Use shared-schema only when the team commits to strict tenant-aware query patterns, tests, and database constraints.
 
+## Tenant-count bands
+
+"Moderate" vs "very high" tenant count is about `tables × tenants`, not row count:
+
+- **Schema-per-tenant is comfortable into the low thousands of schemas.** Each tenant gets a full copy of every `TENANT_APPS` table, so the PostgreSQL catalog, `pg_dump`, autovacuum pressure, and `migrate_schemas` time all scale with `schemas × tables`.
+- **Beyond roughly 5,000–10,000 schemas, or with high tenant churn**, migration time (`O(schemas)`), backup duration, and catalog bloat dominate, and per-schema monitoring gets unwieldy. Prefer shared-schema with `tenant_id` (optionally Citus) at that scale.
+- A handful of very large tenants is fine for schema-per-tenant; a very large *number* of tenants is the real constraint. If most tenants are tiny or transient, per-schema overhead is pure cost — lean shared-schema.
+
+These bands are rules of thumb; validate against the project's table count and migration cadence before committing.
+
 ## Tenant identity resolution
 
 Choose one primary tenant locator and document it.
@@ -71,6 +81,16 @@ Good for global users across many tenants. Validate selected tenant against memb
 ### Token claim
 
 Use in APIs only if the tenant claim is issued by a trusted identity provider or your backend and is validated against current membership. Never trust raw `X-Tenant-ID` headers from clients.
+
+### Single API domain with `django-tenants`
+
+`TenantMainMiddleware` resolves the tenant from the hostname only. An API-first design that serves every tenant from one domain (`api.example.com`) with the tenant carried in a JWT — very common for DRF SaaS — cannot use the stock middleware, which would resolve the wrong tenant (or 404) from the shared host. Instead:
+
+1. Authenticate the request first.
+2. Validate the token's tenant claim against the user's current membership.
+3. Only then activate the schema explicitly with `schema_context(schema_name)` / `tenant_context(tenant)`, or via a `TenantMainMiddleware` subclass that overrides tenant resolution.
+
+Never derive the schema directly from an unvalidated claim — that is the API equivalent of trusting an `X-Tenant-ID` header.
 
 ## Shared schema guardrails
 

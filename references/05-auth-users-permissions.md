@@ -37,6 +37,53 @@ Use when:
 
 For `django-tenants`, consider `django-tenant-users` when this model is required.
 
+## `django-tenant-users` implementation
+
+`django-tenant-users` is the skill's default when one global identity spans many `django-tenants` schemas with different roles per tenant. It moves the user identity into the public schema and keeps per-tenant permissions in each tenant schema, so you do not hand-roll the `Membership` pattern below.
+
+Key API and settings (baseline 2.2.1 — confirm against the installed version):
+
+- **User model** subclasses `tenant_users.tenants.models.UserProfile` and lives in the **public schema** — it is the global identity. Point `AUTH_USER_MODEL` at it. Email is the identifier.
+- **Tenant model** subclasses `tenant_users.tenants.models.TenantBase` (this replaces `TenantMixin`; it adds `slug`, `owner`, and lifecycle fields).
+- **Per-tenant permissions** come from `tenant_users.permissions.models.UserTenantPermissions`, which stores `is_staff`/`is_superuser`/groups/permissions **inside each tenant schema**; `PermissionsMixinFacade` on the user proxies `has_perm`/`is_staff` to whichever tenant schema is active. The same user can be staff in tenant A and a plain member in tenant B.
+- **Auth backend**: `AUTHENTICATION_BACKENDS = ("tenant_users.permissions.backend.UserBackend",)`.
+- **Domain suffix**: `TENANT_USERS_DOMAIN = "example.com"`, used to build tenant subdomains.
+
+App placement is load-bearing — get it wrong and permissions resolve in the wrong schema:
+
+```python
+SHARED_APPS = (
+    "django_tenants",
+    "tenant_users.permissions",   # tables also needed in public
+    "tenant_users.tenants",       # tenant registry + global users
+    "accounts",                   # app holding your UserProfile subclass
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    # ...
+)
+TENANT_APPS = (
+    "django.contrib.contenttypes",
+    "django.contrib.auth",
+    "tenant_users.permissions",   # per-tenant UserTenantPermissions rows
+    # ...
+)
+```
+
+Setup and tenant creation flow:
+
+- Bootstrap once with `create_public_tenant(domain, owner_email)` to create the public tenant and the first global owner.
+- Create tenants with `provision_tenant(name, slug, owner_email, ...)` (under `tenant_users.tenants`), which creates the schema, domain, and owner atomically — do not `Client.objects.create()` by hand.
+- Add/remove members with the tenant's `add_user(user, ...)` / `remove_user(user)` helpers rather than writing permission rows directly; per-tenant roles are expressed through each tenant's groups/permissions in `UserTenantPermissions`.
+
+## Sessions and cookie scope
+
+A session cookie authenticates by storing a `user_id` PK. Two placement mistakes turn that into cross-tenant authentication:
+
+1. **Split scope.** If `django.contrib.auth` (the user table) is in `TENANT_APPS` but `django.contrib.sessions` is in `SHARED_APPS` (or vice versa), a session minted in tenant A resolves its `user_id` against a *different* schema's user table on the next request. Keep the session store and the user table in the **same** scope — both `TENANT_APPS` or both `SHARED_APPS`, never split.
+2. **Wildcard cookie domain.** With subdomain-per-tenant routing, `SESSION_COOKIE_DOMAIN = ".example.com"` makes a cookie issued on `a.example.com` valid on `b.example.com`. Combined with per-tenant user tables, the stored `user_id` PK can resolve to a *different* user with the same PK in tenant B — silent cross-tenant login. Do not set a parent-domain cookie across tenant subdomains; scope cookies to the tenant host.
+
+Also rotate the session with `request.session.cycle_key()` on tenant switch so a captured pre-switch session id cannot be replayed against the new tenant.
+
 ## Membership model pattern
 
 ```python

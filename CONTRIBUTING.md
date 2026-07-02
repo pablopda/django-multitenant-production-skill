@@ -15,6 +15,8 @@ Thanks for helping improve the Django Multi-Tenant Production Skill.
 - Cite sources for version-sensitive claims and update `references/99-sources-and-current-baseline.md` when the baseline changes (current default: Django 5.2 LTS).
 - Don't add runtime dependencies to the scripts.
 - Keep `SKILL.md` frontmatter (`name`, `description`) accurate — it drives auto-triggering.
+- Frontmatter shape: only `name` and `description` are read by **both** Claude Code and Codex. Don't add custom top-level keys (unrecognized fields are silently ignored, so their content never reaches the model); put any extra fields under `metadata:` instead.
+- Doc consistency: if a change touches versions or file layout, update `references/99-sources-and-current-baseline.md`, the README compatibility table, the README file tree, and `CHANGELOG.md` in the same PR.
 
 ## Workflow
 
