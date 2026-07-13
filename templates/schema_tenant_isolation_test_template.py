@@ -42,7 +42,17 @@ class TenantIsolationTests(TenantTestCase):
 
     def test_retrieve_other_tenant_object_denied(self):
         self.fail("TODO: request a tenant B object id from the tenant A client and "
-                  "assert the response status is 403 or 404.")
+                  "assert the response status is 403 or 404 (prefer 404: a 403 on a "
+                  "guessed foreign pk confirms the object exists — an existence oracle).")
+
+    def test_update_other_tenant_object_denied(self):
+        self.fail("TODO: PATCH a tenant B object id from the tenant A client, assert "
+                  "403/404, then re-read tenant B's row in tenant_context(self.tenant_b) "
+                  "and assert it is unchanged.")
+
+    def test_delete_other_tenant_object_denied(self):
+        self.fail("TODO: DELETE a tenant B object id from the tenant A client, assert "
+                  "403/404, then assert the row still exists in tenant B's schema.")
 
     def test_background_task_uses_tenant_context(self):
         self.fail("TODO: run the background task for tenant A and assert tenant B data "

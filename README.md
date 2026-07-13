@@ -37,8 +37,13 @@ django-multitenant-production-skill/
 ├── SKILL.md                     # Main skill instructions (entry point)
 ├── README.md
 ├── LICENSE
+├── .claude-plugin/
+│   ├── plugin.json              # Claude Code plugin manifest
+│   └── marketplace.json         # Single-plugin marketplace for /plugin install
 ├── agents/
 │   └── openai.yaml              # Codex/OpenAI agent interface manifest
+├── hooks/
+│   └── hooks.json               # Plugin hooks (SessionStart / PostToolUse / PreToolUse)
 ├── references/                  # Playbooks & checklists (loaded on demand)
 │   ├── 01-architecture-decision-guide.md
 │   ├── 02-evaluation-scorecard.md
@@ -57,10 +62,15 @@ django-multitenant-production-skill/
 │   ├── implementation-plan.md
 │   ├── schema_tenant_isolation_test_template.py
 │   └── shared_schema_isolation_test_template.py
-└── scripts/                     # Standalone Python helpers (stdlib only)
-    ├── tenant_static_audit.py
-    ├── scaffold_django_tenants_app.py
-    └── generate_tenant_isolation_tests.py
+├── scripts/                     # Standalone Python helpers (stdlib only)
+│   ├── tenant_static_audit.py
+│   ├── scaffold_django_tenants_app.py
+│   ├── generate_tenant_isolation_tests.py
+│   └── hooks/                   # Hook entry points (stdlib only)
+│       ├── session_start_tenancy.py
+│       ├── audit_on_edit.py
+│       └── guard_migrate.py
+└── tests/                       # Self-test suite (python3 -m unittest discover -s tests -t .)
 ```
 
 ---
@@ -71,20 +81,30 @@ The playbooks and scripts were written and validated against these baselines (se
 
 | Component | Baseline version | Notes |
 |---|---|---|
-| Django | 5.2 LTS (default) / 6.0.x | 5.2 LTS is the conservative default (supported through April 2028); use 6.0.x when the project already targets Django 6. |
-| `django-tenants` | 3.10.1 | Schema-per-tenant isolation. |
-| `django-tenant-users` | 2.2.1 | Global users with per-tenant permissions. |
-| `django-multitenant` | 4.1.1 | Shared-schema (`tenant_id` / Citus). |
+| Django | 5.2 LTS (default) / 6.0.x | 5.2 LTS is the conservative default (latest patch 5.2.16, supported through April 2028); use 6.0.x (latest 6.0.7) when the project already targets Django 6. |
+| `django-tenants` | 3.10.2 | Schema-per-tenant isolation. Actively maintained; declares Django 4.2/5.2/6.0. 3.10.2 fixes the multiprocessing migration executor on spawn-default platforms. |
+| `django-tenant-users` | 2.2.1 | Global users with per-tenant permissions. Declares Django 4.2–5.2 only — test explicitly if targeting Django 6.0. |
+| `django-multitenant` | 4.1.1 | Shared-schema (`tenant_id` / Citus). **Caveat:** upstream declares support only through Django 4.2 and has shipped no functional release since Dec 2023 — verify against your Django version or prefer a plain `tenant_id` + PostgreSQL RLS design. |
+| `django-pgschemas` | 1.2.0 | Actively maintained schema-per-tenant alternative (Django 5.2/6.0, Python 3.12+). |
 | Python | 3.10+ | Bundled scripts are standard-library only. |
-| PostgreSQL | Required | Schema-per-tenant relies on PostgreSQL schemas; shared-schema RLS is PostgreSQL-specific. |
+| PostgreSQL | Required (17.x/18.x current) | Schema-per-tenant relies on PostgreSQL schemas; shared-schema RLS is PostgreSQL-specific. No RLS changes in 17/18. |
 
-The skill re-checks your project's pinned versions before implementing; this table is the tested baseline as of **2026-06-09**.
+The skill re-checks your project's pinned versions before implementing; this table is the tested baseline as of **2026-07-13**.
 
 ---
 
 ## Install
 
-### Claude Code
+### Claude Code — as a plugin (recommended)
+
+Plugin installs get the skill **plus its hooks**: a SessionStart tenancy detector, an edit-time incremental isolation audit, and a bare-`migrate` guard for schema-per-tenant projects (see [Hooks](#hooks)).
+
+```text
+/plugin marketplace add pablopda/django-multitenant-production-skill
+/plugin install django-multitenant-production@pablopda-skills
+```
+
+### Claude Code — as a plain skill
 
 **Per project** (available in that repo only) — clone to a temp path so no stray checkout or `.git/` is left in the repo:
 
@@ -103,7 +123,9 @@ mkdir -p ~/.claude/skills
 ln -s ~/skills/django-multitenant-production-skill ~/.claude/skills/django-multitenant-production
 ```
 
-Restart Claude Code so it picks up the new skill.
+The skill is picked up live in a running session; restart Claude Code only if the top-level skills directory itself did not exist when the session started.
+
+> Because the repo ships `.claude-plugin/plugin.json`, a checkout under `~/.claude/skills/` also auto-loads as a `skills-dir` plugin — existing plain-skill installs gain the hooks after a `/reload-plugins` or restart.
 
 ### Codex / OpenAI agents
 
@@ -192,15 +214,29 @@ Both scaffolders write starting points, not finished work — read and adapt the
 
 ---
 
+## Hooks
+
+Installed as a plugin, the skill also registers three Claude Code hooks (`hooks/hooks.json`), all stdlib-only Python and all gated so they stay silent outside multi-tenant Django projects:
+
+| Hook | Event | What it does |
+|---|---|---|
+| `session_start_tenancy.py` | SessionStart (startup/clear) | Detects a multi-tenant Django stack (requirements/pyproject/Pipfile/settings), injects ~100 tokens of tenancy context naming this skill and its hard rules, and snapshots a `tenant_static_audit` baseline for the edit-time hook. |
+| `audit_on_edit.py` | PostToolUse (Edit/Write) | Re-audits after a `.py` edit in a detected multi-tenant repo and surfaces only NEW Critical/High findings for the edited file (baseline-diffed, non-blocking `additionalContext`). |
+| `guard_migrate.py` | PreToolUse (Bash) | In a django-tenants project, escalates a bare `manage.py migrate` to an ask-first permission prompt suggesting `migrate_schemas` (SKILL.md rule 8). Approving is always possible — it is a guard, not a wall. |
+
+Noise controls: the SessionStart baseline is the gate for the other two hooks (no baseline → no audit, no guard), the edit-time audit reports only findings that are new relative to the session baseline, and nothing ever blocks — the strongest action is an ask-first prompt on a genuinely dangerous command. Uninstalling the plugin (or removing `hooks/hooks.json` from a skills-dir install) removes all three.
+
+---
+
 ## Baseline & currency
 
-As of **2026-06-09**, the skill treats **Django 5.2 LTS** as the conservative default for new production SaaS projects (supported through April 2028), unless the repository already standardizes on Django 6.x. The skill always re-checks project dependencies and current package docs before implementing. See `references/99-sources-and-current-baseline.md`.
+As of **2026-07-13**, the skill treats **Django 5.2 LTS** as the conservative default for new production SaaS projects (supported through April 2028), unless the repository already standardizes on Django 6.x. The skill always re-checks project dependencies and current package docs before implementing. See `references/99-sources-and-current-baseline.md`.
 
 ---
 
 ## Versioning
 
-Changes are tracked in [CHANGELOG.md](./CHANGELOG.md) (Keep a Changelog format). The currency baseline lives in `references/99-sources-and-current-baseline.md`; its baseline date (currently **2026-06-09**) is bumped whenever the tested package versions change, and the compatibility table above and the changelog move with it.
+Changes are tracked in [CHANGELOG.md](./CHANGELOG.md) (Keep a Changelog format). The currency baseline lives in `references/99-sources-and-current-baseline.md`; its baseline date (currently **2026-07-13**) is bumped whenever the tested package versions change, and the compatibility table above and the changelog move with it.
 
 ---
 

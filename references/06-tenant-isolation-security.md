@@ -10,6 +10,9 @@ Use this as a security review checklist. Cross-tenant leakage is a critical clas
 - Tenant context is cleared after request/task execution.
 - Client-supplied tenant IDs are never trusted without server-side validation.
 - Tenant identifiers in URLs are non-authoritative unless validated.
+- Hostname-resolved tenancy never runs with `ALLOWED_HOSTS = ['*']` — hosts are validated against the Domain table or an explicit suffix allowlist. Wildcard hosts enable Host-header cache/password-reset poisoning, especially on the public schema with `SHOW_PUBLIC_IF_NO_TENANT_FOUND` enabled.
+- `CSRF_TRUSTED_ORIGINS` is derived per tenant.
+- Password-reset and other absolute URLs are built from the tenant's canonical domain, not the raw request Host.
 
 ## Database access
 
@@ -19,7 +22,7 @@ Use this as a security review checklist. Cross-tenant leakage is a critical clas
 - Bulk update/delete operations are tenant-scoped.
 - Cross-tenant platform queries are isolated in explicit privileged modules.
 - Database constraints enforce tenant-scoped uniqueness.
-- Optional RLS is considered for high-risk shared-schema tables.
+- Optional RLS is considered for high-risk shared-schema tables (see references/04, Row-Level Security defense in depth — ENABLE+FORCE, GUC-based policy).
 
 ## IDOR prevention
 
@@ -27,6 +30,7 @@ Use this as a security review checklist. Cross-tenant leakage is a critical clas
 - URLs containing object IDs cannot access another tenant's object.
 - Exports, imports, attachments, and webhooks are tenant-scoped.
 - Error responses do not leak existence of other-tenant resources beyond intended 404/403 semantics.
+- Prefer 404 for cross-tenant object IDs (DRF returns it automatically when `get_object()` derives from a tenant-scoped `get_queryset()`); a 403 on a guessed foreign PK is itself an existence oracle.
 
 ## Auth and permissions
 

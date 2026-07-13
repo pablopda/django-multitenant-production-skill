@@ -10,6 +10,7 @@ settings automatically.
 from __future__ import annotations
 
 import argparse
+import keyword
 import re
 import sys
 from pathlib import Path
@@ -23,8 +24,10 @@ def snake_case(name: str) -> str:
 
 
 def validate_identifier(value: str, label: str) -> None:
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
-        raise ValueError(f"{label} must be a valid Python identifier: {value!r}")
+    # keyword.iskeyword rejects `class`, `for`, `True`, ... — a keyword passes the regex
+    # but generates code that cannot parse (`class class(TenantMixin):`).
+    if not value.isidentifier() or keyword.iskeyword(value):
+        raise ValueError(f"{label} must be a valid, non-keyword Python identifier: {value!r}")
 
 
 def validate_app_path(value: str) -> None:
@@ -133,6 +136,10 @@ def build_files(app: str, tenant_model: str, domain_model: str) -> dict[str, str
             search_fields = ("domain", "tenant__name", "tenant__schema_name")
     ''').lstrip()
 
+    # An explicit migrations package so the app is migration-ready before the first
+    # makemigrations run (and visible to packaging tools as a regular package).
+    files["migrations/__init__.py"] = ""
+
     files["management/__init__.py"] = ""
     files["management/commands/__init__.py"] = ""
     files["management/commands/provision_tenant.py"] = dedent(f'''
@@ -159,11 +166,16 @@ def build_files(app: str, tenant_model: str, domain_model: str) -> dict[str, str
                 # transaction, so wrapping handle() conflicts with it (and migrations
                 # using CREATE INDEX CONCURRENTLY cannot run inside a transaction block).
                 schema_name = options["schema"].strip().lower()
-                if not re.fullmatch(r"[a-z_][a-z0-9_]*", schema_name) or schema_name.startswith("pg_"):
+                # Same rule as the model's schema_name_validator (letter start), plus the
+                # PostgreSQL identifier length limit -- objects.create() skips field
+                # validators, so the command must enforce the contract itself.
+                if not re.fullmatch(r"[a-z][a-z0-9_]*", schema_name) or schema_name.startswith("pg_"):
                     raise CommandError(
                         f"Invalid schema name {{schema_name!r}}: must match "
-                        "^[a-z_][a-z0-9_]*$ and must not start with 'pg_'."
+                        "^[a-z][a-z0-9_]*$ and must not start with 'pg_'."
                     )
+                if len(schema_name) > 63:
+                    raise CommandError(f"Schema name exceeds PostgreSQL's 63-character limit: {{schema_name!r}}")
                 domain_name = options["domain"].strip().lower().removeprefix("http://").removeprefix("https://").rstrip("/")
                 slug = options.get("slug") or schema_name
 
@@ -178,7 +190,16 @@ def build_files(app: str, tenant_model: str, domain_model: str) -> dict[str, str
                     slug=slug,
                     is_active=bool(options["active"]),
                 )
-                {domain_model}.objects.create(domain=domain_name, tenant={tenant_var}, is_primary=True)
+                try:
+                    {domain_model}.objects.create(domain=domain_name, tenant={tenant_var}, is_primary=True)
+                except Exception as exc:
+                    # The schema is already created and migrated at this point; without a
+                    # domain the tenant is unreachable and invisible to hostname routing.
+                    raise CommandError(
+                        f"Tenant {{schema_name!r}} was created but domain creation failed: {{exc}}. "
+                        "Finish provisioning by creating the domain manually, or remove the "
+                        "tenant row and drop its schema per your offboarding runbook."
+                    )
 
                 self.stdout.write(self.style.SUCCESS(
                     f"Provisioned tenant schema={{schema_name}} domain={{domain_name}} active={{{tenant_var}.is_active}}"
@@ -281,15 +302,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         validate_app_path(args.app)
         validate_identifier(args.tenant_model, "tenant model")
         validate_identifier(args.domain_model, "domain model")
+        if args.tenant_model == args.domain_model:
+            # Identical names generate a models.py where the second class shadows the
+            # first and admin.py registers the same class twice (AlreadyRegistered).
+            raise ValueError("tenant model and domain model must have different names")
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
     root = Path(args.root).resolve()
     app_dir = root.joinpath(*args.app.split("."))
+
+    # Intermediate directories of a dotted app path need __init__.py so the app is a
+    # regular package (implicit namespace packages break find_packages() and surprise
+    # tooling).
+    parts = args.app.split(".")
+    for depth in range(1, len(parts)):
+        parent_init = root.joinpath(*parts[:depth]) / "__init__.py"
+        if not parent_init.exists():
+            write_file(parent_init, "", force=False)
+
     files = build_files(args.app, args.tenant_model, args.domain_model)
+    wrote = 0
+    skipped = 0
     for relative, content in files.items():
-        write_file(app_dir / relative, content, force=args.force)
+        if write_file(app_dir / relative, content, force=args.force):
+            wrote += 1
+        else:
+            skipped += 1
+
+    if skipped:
+        print(f"\nSummary: wrote {wrote} files, skipped {skipped} existing files (use --force to overwrite).")
 
     print("\nNext steps:")
     print("1. Add django-tenants to dependencies and install.")

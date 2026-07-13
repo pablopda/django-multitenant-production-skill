@@ -1,5 +1,16 @@
 # Architecture Decision Guide
 
+## Contents
+
+- Required inputs
+- Decision matrix
+- Production default
+- Tenant-count bands
+- Tenant identity resolution
+- Shared schema guardrails
+- Schema-per-tenant guardrails
+- ADR questions
+
 Use this guide before writing code. Multi-tenancy is an architecture decision, not a package-selection decision.
 
 ## Required inputs
@@ -24,14 +35,14 @@ Capture these facts in the ADR:
 | Model | Best when | Strengths | Costs/Risks | Default verdict |
 |---|---|---|---|---|
 | Database per tenant | enterprise isolation, regulated data, few tenants, custom DB maintenance | strongest isolation, simple restore, per-tenant DB tuning | expensive ops, many connections, migrations across DBs | Use for high-compliance tiers |
-| Schema per tenant | B2B SaaS on PostgreSQL, moderate tenant count, custom domains, per-tenant restore | good isolation, one DB, familiar Django code with `django-tenants` | schema migrations across tenants, cross-tenant analytics complexity | Recommended default |
+| Schema per tenant | B2B SaaS on PostgreSQL, moderate tenant count, custom domains, per-tenant logical restore (with public-schema coupling caveats, see references/08) | good isolation, one DB, familiar Django code with `django-tenants` | schema migrations across tenants, cross-tenant analytics complexity | Recommended default |
 | Shared schema with tenant key | high tenant count, low isolation needs, Citus/distributed Postgres, cheaper ops | simple migrations, efficient common schema, easier analytics | cross-tenant leak risk if filters fail, all code must be tenant-aware | Use only with strong guardrails |
 | Hybrid | different enterprise tiers or regulatory classes | right isolation per customer tier | complex ops and testing matrix | Use intentionally, not accidentally |
 | Deployment per tenant | bespoke enterprise, on-prem, private cloud | strongest app/runtime isolation | high cost, version sprawl | Use for strategic accounts only |
 
 ## Production default
 
-For new Django SaaS on PostgreSQL, use schema-per-tenant with `django-tenants` unless facts justify shared schema or stronger isolation.
+For new Django SaaS on PostgreSQL, use schema-per-tenant with `django-tenants` unless facts justify shared schema or stronger isolation. `django-pgschemas` (1.2.0, Django 5.2/6.0, Python 3.12+) is an actively maintained schema-per-tenant alternative with static/dynamic tenant separation and parallel management commands; evaluate it when its stricter public-schema philosophy or higher Python floor fits the project.
 
 Add `django-tenant-users` if one human identity must access multiple tenants with different roles/permissions.
 

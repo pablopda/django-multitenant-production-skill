@@ -69,6 +69,7 @@ Tenant locator:
 
 - Provisioning:
 - Migrations:
+- Connection pooling (pooler mode / `CONN_MAX_AGE`; schema-per-tenant requires session-mode pooling):
 - Backup/restore:
 - Offboarding:
 - Observability/audit:
@@ -85,6 +86,7 @@ Required tests:
 - [ ] background job cannot cross tenants
 - [ ] tenant admin cannot cross tenants
 - [ ] migration tested across at least two tenants
+- [ ] pooler runs in session mode (or no external pooler) for schema-per-tenant connections
 
 ## Consequences
 

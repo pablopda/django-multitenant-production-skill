@@ -1,5 +1,22 @@
 # `django-tenants` Schema-Per-Tenant Playbook
 
+## Contents
+
+- Baseline architecture
+- Required settings
+- Tenant and domain models
+- Provisioning flow
+- Migrations
+- Connection pooling
+- Request-time code
+- Channels and websockets
+- Background jobs and commands
+- Cache
+- Files/media/static/templates
+- Admin
+- Tests
+- Common mistakes
+
 Use for PostgreSQL schema-per-tenant applications.
 
 ## Baseline architecture
@@ -63,6 +80,8 @@ PUBLIC_SCHEMA_URLCONF = "myproject.urls_public"    # public/marketing/signup URL
 ```
 
 Review whether auth/admin should live in public, tenant schemas, or both. Do not blindly copy app lists.
+
+An app listed in BOTH `SHARED_APPS` and `TENANT_APPS` gets its tables created in the public schema AND every tenant schema, and with `search_path = [tenant, public]` the tenant copy shadows the public one at query time — so the example above implements per-tenant users/sessions. Keep `django.contrib.auth` and `django.contrib.sessions` in the SAME scope: splitting them (e.g. shared auth, tenant sessions) binds sessions to users that resolve in a different schema. For global users across tenants (`django-tenant-users`), see `references/05-auth-users-permissions.md`.
 
 ### Hostname resolution and the public schema
 
@@ -133,6 +152,14 @@ python manage.py migrate_schemas
 python manage.py migrate_schemas --schema=tenant_schema_name
 ```
 
+To parallelize across tenant schemas:
+
+```bash
+python manage.py migrate_schemas --executor multiprocessing
+```
+
+Tune with `TENANT_MULTIPROCESSING_MAX_PROCESSES` and `TENANT_MULTIPROCESSING_CHUNKS`. Parallelism multiplies DB connections — respect pool limits. django-tenants 3.10.2 fixed the multiprocessing executor on spawn-default platforms by forcing the fork start method; earlier releases break there.
+
 Production migration checklist:
 
 - dry-run or test against at least two tenant schemas
@@ -161,20 +188,42 @@ Good practices:
 - use `schema_context(schema_name)` or `tenant_context(tenant)` outside request flow
 - fail closed when tenant is missing, inactive, or suspended
 
+## Channels and websockets
+
+`TenantMainMiddleware` is HTTP-only. Websocket consumers get NO schema set: ORM calls silently run against the default `search_path`, and channel-layer group names without a tenant prefix broadcast cross-tenant.
+
+- Resolve the tenant in custom ASGI middleware — from the scope's host header or the authenticated session — validated against the `Domain` table.
+- Wrap consumer DB access in `schema_context(...)` inside `sync_to_async`.
+- Prefix channel-layer group names with the schema name, e.g. `f"{schema_name}.notifications"`.
+- Add a negative test: tenant A's socket never receives tenant B's group events.
+
 ## Background jobs and commands
 
 Every task touching tenant data must include tenant context.
 
+Prefer `tenant-schemas-celery` as the standard integration: it propagates the schema automatically via task headers, ships a `TenantTask` base class, and supports beat. Use the hand-rolled pattern below as fallback when the dependency is unwanted.
+
 Example pattern:
 
 ```python
+import logging
+
 from celery import shared_task
+from django.db import OperationalError
 from django_tenants.utils import tenant_context
 from customers.models import Client
 
-@shared_task(bind=True, autoretry_for=(Exception,), retry_backoff=True)
+logger = logging.getLogger(__name__)
+
+# Retry only transient DB errors. A missing/inactive tenant is permanent —
+# autoretry_for=(Exception,) would retry Client.DoesNotExist forever.
+@shared_task(bind=True, autoretry_for=(OperationalError,), retry_backoff=True)
 def recompute_usage(self, tenant_id):
-    tenant = Client.objects.get(pk=tenant_id, is_active=True)
+    try:
+        tenant = Client.objects.get(pk=tenant_id, is_active=True)
+    except Client.DoesNotExist:
+        logger.warning("recompute_usage: tenant %s missing or inactive, skipping", tenant_id)
+        return
     with tenant_context(tenant):
         # Tenant-owned ORM queries here
         ...
@@ -182,19 +231,31 @@ def recompute_usage(self, tenant_id):
 
 Avoid tasks that accept only a tenant-owned object ID. Use tenant ID/schema plus object ID.
 
-For management commands, use tenant-aware wrappers or explicitly iterate tenants and enter context.
+Celery beat: run one dispatcher periodic task that iterates active tenants and fans out per-tenant tasks carrying `schema_name`/tenant id. Do not run tenant work directly inside the beat task.
+
+For management commands, use the package wrappers: `BaseTenantCommand` for custom commands, `tenant_command` to run any command in one tenant (`python manage.py tenant_command loaddata --schema=acme`), `all_tenants_command` to run it across every tenant. Shipped commands: `create_tenant`, `create_tenant_superuser`, `clone_tenant` (template-based provisioning), `rename_schema`, `delete_tenant`. Otherwise iterate tenants and enter context explicitly.
 
 ## Cache
 
-Use tenant-aware cache keys. For `django-tenants`, prefer the package key function or a project wrapper that includes schema name.
+Primary fix — set the package key functions in settings; this schema-prefixes every cache call globally, no call-site changes:
 
-Bad:
+```python
+CACHES = {
+    "default": {
+        # BACKEND/LOCATION...
+        "KEY_FUNCTION": "django_tenants.cache.make_key",
+        "REVERSE_KEY_FUNCTION": "django_tenants.cache.reverse_key",
+    }
+}
+```
+
+Bad (unprefixed key, collides across tenants):
 
 ```python
 cache.set("dashboard_stats", stats)
 ```
 
-Better:
+Fallback only — for non-default caches or non-django-tenants stacks, prefix manually:
 
 ```python
 cache.set(f"tenant:{connection.schema_name}:dashboard_stats", stats)
@@ -267,10 +328,11 @@ Minimum negative tests:
 - middleware order wrong
 - tenant model app missing from `SHARED_APPS`
 - tenant apps included in shared apps accidentally
-- running `migrate` instead of tenant migration command without understanding effect
+- not knowing which `migrate` actually runs: with django_tenants winning command resolution (listed first in `INSTALLED_APPS`), `migrate` is aliased to `migrate_schemas` and migrates ALL schemas during what was meant as a hotfix; an un-aliased `migrate` (django_tenants not winning resolution, or direct `django.core` invocation) bypasses tenant schemas entirely
 - tenant deletion drops schema unexpectedly
 - Celery tasks run in public schema
 - admin exposes public/global tables to tenant staff
 - transaction-mode PgBouncer resets/reuses `search_path` across tenants (see Connection pooling)
 - serving tenant URLs on the public schema because `PUBLIC_SCHEMA_URLCONF` is unset
+- channel-layer group names without a tenant prefix broadcast events cross-tenant (see Channels and websockets)
 - tests use only one tenant/schema

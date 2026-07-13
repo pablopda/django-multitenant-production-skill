@@ -7,6 +7,20 @@ Multi-tenant auth has two separate questions:
 
 Do not collapse those into global `is_staff`, `is_superuser`, or global groups unless every tenant has identical permissions.
 
+## Contents
+
+- [Common models](#common-models)
+- [`django-tenant-users` implementation](#django-tenant-users-implementation)
+- [Sessions and cookie scope](#sessions-and-cookie-scope)
+- [Membership model pattern](#membership-model-pattern)
+- [Tenant switching](#tenant-switching)
+- [Invitations](#invitations)
+- [Support/admin impersonation](#supportadmin-impersonation)
+- [Django admin](#django-admin)
+- [DRF permissions](#drf-permissions)
+- [API tokens and service accounts](#api-tokens-and-service-accounts)
+- [Authorization test cases](#authorization-test-cases)
+
 ## Common models
 
 ### Per-tenant user accounts
@@ -71,8 +85,15 @@ TENANT_APPS = (
 
 Setup and tenant creation flow:
 
-- Bootstrap once with `create_public_tenant(domain, owner_email)` to create the public tenant and the first global owner.
-- Create tenants with `provision_tenant(name, slug, owner_email, ...)` (under `tenant_users.tenants`), which creates the schema, domain, and owner atomically — do not `Client.objects.create()` by hand.
+- Bootstrap once with `create_public_tenant(domain, owner_email)` (in `tenant_users.tenants.utils`; returns `(tenant, domain, user)`) to create the public tenant and the first global owner.
+- Create tenants with `provision_tenant` from `tenant_users.tenants.tasks`, which creates the schema, domain, and owner atomically — do not `Client.objects.create()` by hand. Signature in 2.2.1: `provision_tenant(tenant_name, tenant_slug, owner, *, is_staff=False, is_superuser=True, tenant_type=None, schema_name=None, tenant_extra_data=None)`, returning `(tenant, domain)`. The third argument is a **user instance** — the pre-2.0 API took an email string. Unless `schema_name=` is passed explicitly, the schema name is auto-generated as `f"{slug}_{timestamp}"` — surprising if you expect slug == schema.
+
+  ```python
+  from tenant_users.tenants.tasks import provision_tenant
+
+  tenant, domain = provision_tenant(tenant_name="Acme", tenant_slug="acme", owner=user)
+  ```
+
 - Add/remove members with the tenant's `add_user(user, ...)` / `remove_user(user)` helpers rather than writing permission rows directly; per-tenant roles are expressed through each tenant's groups/permissions in `UserTenantPermissions`.
 
 ## Sessions and cookie scope

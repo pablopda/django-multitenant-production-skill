@@ -4,6 +4,23 @@ Use when all tenants share tables and every tenant-owned row has a tenant/accoun
 
 Shared schema can be production-grade, but it is easier to leak data. The skill must be stricter here than in schema-per-tenant designs.
 
+## Contents
+
+- [Required design elements](#required-design-elements)
+- [Model pattern](#model-pattern)
+- [DRF patterns](#drf-patterns)
+- [Object permissions](#object-permissions)
+- [Tenant context middleware](#tenant-context-middleware)
+- [Async and ASGI](#async-and-asgi)
+- [Database constraints](#database-constraints)
+- [Row-Level Security defense in depth](#row-level-security-defense-in-depth)
+- [Background jobs](#background-jobs)
+- [Per-tenant rate limiting](#per-tenant-rate-limiting)
+- [Cache and storage](#cache-and-storage)
+- [Reporting and global admin](#reporting-and-global-admin)
+- [Minimum tests](#minimum-tests)
+- [`django-multitenant` notes](#django-multitenant-notes)
+
 ## Required design elements
 
 1. A canonical tenant model, usually `Account`, `Organization`, `Workspace`, or `Tenant`.
@@ -13,7 +30,7 @@ Shared schema can be production-grade, but it is easier to leak data. The skill 
 5. Tenant-scoped foreign key constraints where feasible.
 6. Tenant-aware API/admin/tasks/commands.
 7. Negative tests for all user-facing surfaces.
-8. Optional PostgreSQL Row-Level Security for high-risk tables.
+8. Optional PostgreSQL Row-Level Security for high-risk tables (see [Row-Level Security defense in depth](#row-level-security-defense-in-depth)).
 
 ## Model pattern
 
@@ -98,7 +115,30 @@ Shared-schema apps need an explicit request tenant context:
 4. Attach `request.tenant`.
 5. Clear context at the end of request.
 
-Use Python `contextvars` carefully if code needs context outside request objects. Reset it after each request/task to avoid leakage across threads/async tasks.
+Use Python `contextvars` carefully if code needs context outside request objects. Reset it after each request/task to avoid leakage across threads/async tasks — see [Async and ASGI](#async-and-asgi) for the required pattern.
+
+## Async and ASGI
+
+Under ASGI, store the current tenant in a `contextvars.ContextVar`, never `threading.local`. `sync_to_async(thread_sensitive=True)` — the Django ORM default — reuses ONE thread across requests, so leftover thread-local tenant state survives between requests. asgiref's `Local` also behaves differently across await boundaries than `threading.local`; do not assume they are interchangeable.
+
+Middleware must set the tenant, call the view, and unset in `finally`:
+
+```python
+current_tenant: ContextVar["Tenant | None"] = ContextVar("current_tenant", default=None)
+
+class TenantContextMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        token = current_tenant.set(resolve_tenant(request))
+        try:
+            return self.get_response(request)
+        finally:
+            current_tenant.reset(token)
+```
+
+Apply the same unset in Celery task teardown (`task_postrun` signal or a `finally` block), not just the web tier. Require the negative regression test from the [middleware caveat](#middleware-caveat) below: an anonymous or tenant-B request after a tenant-A request on the same worker sees no leftover context.
 
 ## Database constraints
 
@@ -110,7 +150,44 @@ models.UniqueConstraint(fields=["tenant", "external_id"], name="uniq_external_id
 
 Consider composite keys or extra constraints for critical child tables to ensure a child cannot reference a parent from another tenant.
 
-For PostgreSQL, consider Row-Level Security when the risk justifies it. RLS is not a substitute for app-level scoping, but it can provide defense in depth.
+For PostgreSQL, consider Row-Level Security when the risk justifies it — see [Row-Level Security defense in depth](#row-level-security-defense-in-depth) for the concrete pattern.
+
+## Row-Level Security defense in depth
+
+RLS backstops app-level scoping on high-risk tables. It is not a substitute for scoped querysets — it catches the query someone forgot to scope.
+
+Enable per table in a migration (`RunSQL` or `RunPython`):
+
+```sql
+ALTER TABLE app_project ENABLE ROW LEVEL SECURITY;
+ALTER TABLE app_project FORCE ROW LEVEL SECURITY;
+```
+
+`FORCE` is load-bearing: superusers and the table OWNER silently bypass RLS otherwise, and most Django apps connect as the owning role — plain `ENABLE` gives zero protection while creating false confidence.
+
+Policy keyed on a session GUC:
+
+```sql
+CREATE POLICY tenant_isolation ON app_project
+    USING (tenant_id = current_setting('app.current_tenant')::bigint);
+```
+
+Set the GUC per transaction from Django — e.g., middleware that wraps the request in `transaction.atomic()` and sets it first (a `connection_created`/pre-request hook works too):
+
+```python
+with transaction.atomic():
+    with connection.cursor() as cursor:
+        cursor.execute("SET LOCAL app.current_tenant = %s", [request.tenant.pk])
+    return self.get_response(request)
+```
+
+Prefer a non-owner application role where operationally possible.
+
+Fail-closed property: with no GUC set, `current_setting(...)` errors (or returns nothing with the `, true` missing-ok form) and the policy matches zero rows — the exact fail-closed complement to django-multitenant's fail-open manager (see [`django-multitenant` notes](#django-multitenant-notes)).
+
+Pooling: `SET LOCAL` is transaction-scoped, so GUC-based RLS is safe under transaction-mode PgBouncer — unlike search_path-based isolation (contrast with the pooling section in references/03).
+
+Test: a query without the GUC set must return zero rows.
 
 ## Background jobs
 
@@ -131,6 +208,18 @@ Bad:
 def send_project_digest(project_id):
     project = Project.objects.get(pk=project_id)
 ```
+
+## Per-tenant rate limiting
+
+DRF's stock throttles ignore tenant: `UserRateThrottle` keys collide for users active in multiple tenants, and anon buckets are shared across all tenants. Subclass and key by tenant:
+
+```python
+class TenantUserRateThrottle(UserRateThrottle):
+    def get_cache_key(self, request, view):
+        return f"throttle:{request.tenant.pk}:{self.scope}:{request.user.pk}"
+```
+
+For Celery, use per-tenant queues or per-tenant rate limits wherever one tenant's jobs can starve others.
 
 ## Cache and storage
 

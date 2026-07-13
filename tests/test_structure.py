@@ -13,7 +13,7 @@ from tests.util import REFERENCES_DIR, REPO_ROOT, SCRIPTS_DIR, SKILL_MD, TEMPLAT
 
 # Fields the two supported runtimes (Claude Code, Codex) are documented to read,
 # plus the optional fields the agent-skills format allows.
-ALLOWED_TOP_LEVEL_FIELDS = {"name", "description", "metadata", "license", "allowed-tools"}
+ALLOWED_TOP_LEVEL_FIELDS = {"name", "description", "metadata", "license", "compatibility", "allowed-tools"}
 
 
 class FrontmatterTests(unittest.TestCase):

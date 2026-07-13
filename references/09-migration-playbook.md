@@ -1,5 +1,18 @@
 # Migration Playbook: Single-Tenant to Multi-Tenant
 
+## Contents
+
+- Migration principles
+- Phase 0: Discovery
+- Phase 1: Choose architecture
+- Phase 2A: Schema-per-tenant migration
+- Phase 2B: Shared-schema migration
+- Phase 3: Auth and permissions
+- Phase 4: Files and cache
+- Phase 5: Background jobs and integrations
+- Phase 6: Production rollout
+- Exit criteria
+
 Use when converting an existing Django app to multi-tenancy.
 
 ## Migration principles
@@ -54,18 +67,24 @@ Typical path:
 4. create public tenant
 5. move tenant-owned apps to tenant schemas
 6. migrate public schema and tenant schema(s)
-7. load existing data into first tenant schema
+7. load existing data into first tenant schema (highest-risk step — see below)
 8. update URLs/domains
 9. add tests
 10. repeat for additional tenants/imports
 
+Step 7 data load in detail:
+
+- **Cutover:** maintenance freeze (stop writes, dump, load, verify, flip routing) or dual-write with a verification window (write old+new, compare per-table row counts/checksums, cut reads last). Freeze is simpler; use dual-write only when downtime is unacceptable.
+- **PK/sequence collisions** when consolidating multiple ex-single-tenant databases: assign non-overlapping ID offset ranges per source, or issue new UUIDs plus an old-to-new mapping table for FK rewrite. Either way, reset sequences (`setval`) after load.
+- **Contenttypes trap:** ContentType PKs differ per schema/database, so naive `dumpdata`/`loaddata` silently corrupts GenericForeignKey and permission rows. Use `dumpdata --natural-foreign --natural-primary` and exclude `contenttypes` and `auth.permission`, or remap IDs in a data migration.
+
 Risks:
 
-- auth tables in wrong schema
-- contenttypes/permissions mismatch
-- migrations not idempotent
-- data migrations assuming public schema
-- file paths still global
+- auth tables in wrong schema — verify the `SHARED_APPS`/`TENANT_APPS` split against references/03 before the first migrate; inspect the actual schemas
+- contenttypes/permissions mismatch — exclude both from data loads (natural keys, see above); let `migrate_schemas` recreate them per schema
+- migrations not idempotent — run full `migrate_schemas` twice on a staging copy; the second run must be a no-op
+- data migrations assuming public schema — wrap in `schema_context`/tenant iteration and test on at least two schemas
+- file paths still global — audit `upload_to`/storage keys for a tenant prefix before cutover (Phase 4)
 
 ## Phase 2B: Shared-schema migration
 

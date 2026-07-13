@@ -1,0 +1,14 @@
+{
+  "name": "pablopda-skills",
+  "owner": {
+    "name": "Pablo Perez De Angelis"
+  },
+  "plugins": [
+    {
+      "name": "django-multitenant-production",
+      "source": "./",
+      "description": "Production-grade Django multi-tenancy: isolation playbooks, static audit, test scaffolds, and tenancy guard hooks.",
+      "category": "security"
+    }
+  ]
+}

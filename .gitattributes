@@ -1,0 +1,8 @@
+# Keep `git archive` exports (and archive-based installs) a clean skill artifact:
+# SKILL.md + references/ + templates/ + scripts/ + hooks/ + plugin manifests + LICENSE.
+.github export-ignore
+tests export-ignore
+CONTRIBUTING.md export-ignore
+CHANGELOG.md export-ignore
+.gitattributes export-ignore
+.gitignore export-ignore

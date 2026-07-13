@@ -1,8 +1,11 @@
 ---
 name: django-multitenant-production
 description: Production playbooks, isolation tests, and scaffolds for Django multi-tenant SaaS. Use to evaluate, validate, design, build, repair, refactor, secure, or migrate multi-tenancy/multitenancy in Django — tenant isolation, django-tenants, django-tenant-users, django-multitenant, schema-per-tenant or shared-schema (tenant_id / row-level scoping / Citus) designs, organizations, workspaces, accounts, account-scoped apps, or converting a single-tenant Django app to multi-tenant. Reach for it whenever a Django app serves multiple tenants and you need production-grade, tested isolation or a B2B SaaS readiness review.
+license: MIT
+compatibility: Bundled scripts require Python 3.10+ (standard library only). Target project should be Django on PostgreSQL. Works in Claude Code and Codex/OpenAI agent runtimes.
+allowed-tools: Bash(python3 ${CLAUDE_SKILL_DIR}/scripts/*)
 metadata:
-  version: 1.1.0
+  version: 1.2.0
 ---
 
 # Django Multi-Tenant Production Skill
@@ -91,7 +94,8 @@ Use this when asked to review an existing app or architecture.
    - tests and factories
    - logging/audit/metrics
 4. Run static audit if tools are available:
-   `python scripts/tenant_static_audit.py --root .`
+   `python3 ${CLAUDE_SKILL_DIR}/scripts/tenant_static_audit.py --root <project_root>`
+   (if `${CLAUDE_SKILL_DIR}` is unavailable in your runtime, resolve the path relative to the directory containing this SKILL.md)
 5. Produce a validation report using `templates/validation-report.md`.
 
 ## Build workflow
@@ -202,12 +206,16 @@ For builds, produce:
 
 ## Scripts and templates
 
-Bundled tooling lives under this skill's `scripts/` and `templates/` directories. Paths are relative to the skill directory, not the target project.
+Bundled tooling lives under this skill's `scripts/` and `templates/` directories. Invoke scripts through `${CLAUDE_SKILL_DIR}` (Claude Code substitutes the skill's install directory); in runtimes without that substitution, resolve paths relative to the directory containing this SKILL.md — never relative to the target project.
 
-- **Evaluate** — `scripts/tenant_static_audit.py`: AST/regex audit for tenant-isolation smells. `--root <project_root>` selects the project to scan (not the skill dir); `--format json` for machine output; `--fail-on <Critical|High|Medium|Low|Info>` exits non-zero for CI gating.
-- **Validate** — `scripts/generate_tenant_isolation_tests.py`: emits a cross-tenant negative-test skeleton. `--mode schema|shared` (required) picks the template; `--output <path>` and `--force` control the target file. Treat generated tests as scaffolds to complete, not proof.
-- **Build** — `scripts/scaffold_django_tenants_app.py`: scaffolds a `django-tenants` tenant/domain app and provisioning command. `--app`, `--tenant-model`, `--domain-model`, `--force`; run with the project root as `--root`.
+- **Evaluate** — `python3 ${CLAUDE_SKILL_DIR}/scripts/tenant_static_audit.py`: AST/regex audit for tenant-isolation smells. `--root <project_root>` selects the project to scan (not the skill dir); `--format json` for machine output; `--fail-on <Critical|High|Medium|Low|Info>` exits non-zero for CI gating; `--tenancy schema|shared` overrides stack detection for the ORM heuristics (schema-per-tenant suppresses idiomatic in-request ORM flags per the code-review heuristics above); `--tenant-term` teaches it your tenant noun.
+- **Validate** — `python3 ${CLAUDE_SKILL_DIR}/scripts/generate_tenant_isolation_tests.py`: emits a cross-tenant negative-test skeleton. `--mode schema|shared` (required) picks the template; `--output <path>` and `--force` control the target file. Treat generated tests as scaffolds to complete, not proof.
+- **Build** — `python3 ${CLAUDE_SKILL_DIR}/scripts/scaffold_django_tenants_app.py`: scaffolds a `django-tenants` tenant/domain app and provisioning command. `--app`, `--tenant-model`, `--domain-model`, `--force`; run with the project root as `--root`.
 - **Report/plan templates** — `templates/validation-report.md`, `templates/adr-tenancy-decision.md`, `templates/implementation-plan.md`, and the two isolation-test templates (`templates/schema_tenant_isolation_test_template.py`, `templates/shared_schema_isolation_test_template.py`).
+
+## Hooks (plugin installs)
+
+When installed as a Claude Code plugin, this skill ships hooks (`hooks/hooks.json`) that harden tenancy work even when the skill is not explicitly invoked: a SessionStart detector that recognizes a multi-tenant Django project, injects tenancy context, and snapshots an audit baseline; a PostToolUse hook that re-audits edited Python files and surfaces NEW Critical/High isolation findings; and a PreToolUse guard that asks before a bare `manage.py migrate` runs in a schema-per-tenant project. Plain-skill installs work without the hooks; see the README for plugin installation.
 
 ## Completion standard
 

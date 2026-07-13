@@ -1,5 +1,23 @@
 # Evaluation Scorecard
 
+## Contents
+
+- Scoring
+- Domains
+  1. Architecture and tenancy model
+  2. Tenant context resolution
+  3. Data isolation
+  4. Authentication and authorization
+  5. APIs and views
+  6. Admin
+  7. Background jobs, signals, and commands
+  8. Cache, sessions, rate limits, and queues
+  9. Files, media, static, templates
+  10. Migrations and data lifecycle
+  11. Observability and audit
+  12. Tests
+- Verdict rubric
+
 Use this scorecard for existing applications, design reviews, and PR reviews.
 
 ## Scoring
@@ -11,7 +29,7 @@ Score each domain:
 - 2 = mostly implemented, some gaps
 - 3 = production-ready evidence present
 
-A score of 0 in tenant context, data isolation, auth, or tests means the project is **not production-ready**.
+Critical domains: 2 (tenant context resolution), 3 (data isolation), 4 (authentication and authorization), and 12 (tests). A score of 0 in any critical domain means the project is **not production-ready**.
 
 ## Domains
 
@@ -53,6 +71,7 @@ Evidence:
 - managers/querysets
 - object lookup patterns
 - database-level constraints where applicable
+- connection pooler mode for schema-per-tenant: session-mode pooling or no external pooler (`CONN_MAX_AGE`); pooler config documented
 
 Red flags:
 
@@ -60,6 +79,7 @@ Red flags:
 - global `.objects.all()` in tenant endpoints
 - raw SQL without schema/tenant binding
 - bulk update/delete without tenant filter
+- schema-per-tenant Django connections routed through transaction- or statement-mode PgBouncer (search_path leakage — automatic Critical)
 
 ### 4. Authentication and authorization
 
@@ -163,7 +183,7 @@ Evidence:
 
 Red flags:
 
-- uses plain `migrate` in schema-per-tenant app without understanding consequences
+- not knowing which `migrate` actually runs: django-tenants ships a `migrate` command aliased to `migrate_schemas` when django_tenants wins command resolution (listed first in `INSTALLED_APPS`). An un-aliased `migrate` (django_tenants not winning resolution, or direct `django.core` invocation) bypasses tenant schemas; the aliased one migrates ALL schemas during what was meant as a hotfix
 - no test tenant migration
 - destructive tenant deletion by default
 
@@ -200,6 +220,6 @@ Red flags:
 
 ## Verdict rubric
 
-- **Ready**: all critical domains score 3, no Critical/High findings open, validation commands pass.
+- **Ready**: all critical domains (2, 3, 4, 12) score 3, no Critical/High findings open, validation commands pass.
 - **Conditionally ready**: no Critical findings, High findings have specific mitigations and owner/date.
-- **Not ready**: any Critical finding, or score 0 in tenant context, data isolation, auth, or tests.
+- **Not ready**: any Critical finding, score 0 in any critical domain, or schema-per-tenant connections pooled in transaction/statement mode (automatic Critical).

@@ -18,6 +18,7 @@ EXPECTED_FILES = (
     "apps.py",
     "models.py",
     "admin.py",
+    "migrations/__init__.py",
     "management/__init__.py",
     "management/commands/__init__.py",
     "management/commands/provision_tenant.py",
@@ -87,9 +88,37 @@ class ScaffoldTests(unittest.TestCase):
                 ("--root", tmp, "--app", "9bad"),
                 ("--root", tmp, "--app", "ok", "--tenant-model", "Bad-Name"),
                 ("--root", tmp, "--app", "ok", "--domain-model", "also bad"),
+                # Python keywords pass an identifier regex but generate unparseable code.
+                ("--root", tmp, "--app", "ok", "--tenant-model", "class"),
+                ("--root", tmp, "--app", "global.tenants"),
+                ("--root", tmp, "--app", "ok", "--domain-model", "True"),
             ):
                 code, _, err = run_main(*argv)
                 self.assertEqual(code, 2, f"should reject {argv}: {err}")
+
+    def test_identical_tenant_and_domain_models_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _, err = run_main(
+                "--root", tmp, "--app", "customers",
+                "--tenant-model", "Domain", "--domain-model", "Domain",
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("different", err)
+
+    def test_dotted_app_creates_regular_packages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _, err = run_main("--root", tmp, "--app", "apps.tenants")
+            self.assertEqual(code, 0, err)
+            self.assertTrue((Path(tmp) / "apps" / "__init__.py").exists(),
+                            "intermediate dirs must be regular packages, not namespace packages")
+
+    def test_rerun_prints_skip_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_main("--root", tmp, "--app", "customers")
+            code, out, _ = run_main("--root", tmp, "--app", "customers")
+            self.assertEqual(code, 0)
+            self.assertIn("skipped", out)
+            self.assertIn("--force", out)
 
     def test_provision_command_validates_schema_names(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -11,6 +11,12 @@ so the ORM/scoping heuristics recognize the noun your project actually uses. Whe
 a sensible default set is used and the audit also tries to infer extra terms from settings
 (TENANT_MODEL) and tenant model class names.
 
+The ORM heuristics are tenancy-model-aware, matching the skill's code-review heuristics:
+in a schema-per-tenant (django-tenants) project, bare ORM calls inside request-path code
+are idiomatic (the middleware set the search_path), so those rules only fire in code that
+can run outside a tenant request (tasks, commands, migrations, signals). Shared-schema and
+unknown stacks keep the strict behavior. Override detection with --tenancy schema|shared.
+
 No external dependencies required. Runs on CPython 3.8+.
 """
 
@@ -45,6 +51,9 @@ IGNORE_DIRS = {
     "build",
 }
 
+# Files with no suffix that still matter (iter_files is otherwise suffix-driven).
+NO_SUFFIX_FILES = {"Pipfile"}
+
 HIGH_RISK_FILE_HINTS = (
     "view",
     "api",
@@ -53,6 +62,8 @@ HIGH_RISK_FILE_HINTS = (
     "admin",
     "task",
     "job",
+    "signal",
+    "command",
     "resolver",
     "schema",
     "mutation",
@@ -104,17 +115,17 @@ FRAMEWORK_CONTEXT_WORDS = (
     "all_tenants_command",
 )
 
-# Request attributes that carry client-controlled input (never a trustworthy tenant id).
-CLIENT_TENANT_SOURCES = (
-    "request.get",
-    "request.post",
-    "request.data",
-    "request.query_params",
-    "request.headers",
-    "request.meta",
-    "request.cookies",
-    "kwargs",
-)
+# request attributes that carry client-controlled input (never a trustworthy tenant id).
+# Matched as exact dotted segments so request.get_host()/get_signed_cookie() do not collide.
+CLIENT_REQUEST_ATTRS = {
+    "get",
+    "post",
+    "data",
+    "query_params",
+    "headers",
+    "meta",
+    "cookies",
+}
 
 # Assignment markers that identify a Django settings module even without a "settings" path.
 SETTINGS_MARKERS = (
@@ -144,6 +155,7 @@ class ProjectFacts:
     root: str
     packages: dict[str, str]
     detected_stack: list[str]
+    tenancy_mode: str
     settings_files: list[str]
     tenant_terms: list[str]
     python_files_scanned: int
@@ -159,6 +171,8 @@ class TenantVocab:
     context_words: tuple[str, ...]
     scoping_hints: tuple[str, ...]
     field_regex: "re.Pattern[str]"
+    context_regex: "re.Pattern[str]"
+    scoping_regex: "re.Pattern[str]"
 
 
 def relpath(path: Path, root: Path) -> str:
@@ -188,13 +202,23 @@ def iter_files(root: Path) -> Iterator[Path]:
             path = Path(dirpath) / filename
             if path.suffix in {".py", ".txt", ".in", ".toml", ".lock", ".cfg", ".ini", ".yml", ".yaml", ".md"}:
                 yield path
+            elif path.name in NO_SUFFIX_FILES:
+                yield path
 
 
 def read_text(path: Path) -> str:
+    """Best-effort text read. Returns "" for unreadable files instead of crashing the scan
+    (broken symlinks, permission-denied, files deleted mid-scan)."""
     try:
-        return path.read_text(encoding="utf-8")
+        # utf-8-sig strips a UTF-8 BOM if present (a BOM makes ast.parse fail on the str).
+        return path.read_text(encoding="utf-8-sig")
     except UnicodeDecodeError:
-        return path.read_text(encoding="utf-8", errors="replace")
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+    except OSError:
+        return ""
 
 
 def line_at(text: str, line: int) -> str:
@@ -222,6 +246,28 @@ def contains_any(text: str, terms: Sequence[str]) -> bool:
     return any(term.lower() in lowered for term in terms)
 
 
+def compile_terms_regex(terms: Sequence[str]) -> "re.Pattern[str]":
+    """Compile terms into one alternation with a leading letter/digit boundary.
+
+    Plain substring matching lets short terms hide in common words ("org" in "forgot",
+    "account" in unrelated identifiers) and silently suppress findings. Requiring a
+    non-alphanumeric character (or start) before the term keeps "org_id", "orgs" and
+    "for_org" matching while rejecting "forgot"/"cyborg". No trailing boundary: hints are
+    stems ("tenant" should match "tenants", "view" should match "views").
+    """
+    parts = sorted({t.lower() for t in terms if t}, key=len, reverse=True)
+    if not parts:
+        parts = ["\x00never-matches\x00"]
+    joined = "|".join(
+        (r"(?<![a-z0-9])" if p[0].isalnum() else "") + re.escape(p)
+        for p in parts
+    )
+    return re.compile(joined, re.IGNORECASE)
+
+
+HIGH_RISK_HINT_REGEX = compile_terms_regex(HIGH_RISK_FILE_HINTS)
+
+
 def context_window(lines: Sequence[str], lineno: int, radius: int = 8) -> str:
     start = max(0, lineno - 1 - radius)
     end = min(len(lines), lineno + radius)
@@ -231,7 +277,8 @@ def context_window(lines: Sequence[str], lineno: int, radius: int = 8) -> str:
 def is_test_file(path: Path, root: Path) -> bool:
     parts = set(rel_parts(path, root))
     name = path.name.lower()
-    return "tests" in parts or name.startswith("test_") or name.endswith("_test.py")
+    # tests.py is Django's default per-app test module and must count as tests.
+    return "tests" in parts or name == "tests.py" or name.startswith("test_") or name.endswith("_test.py")
 
 
 def is_migration_file(path: Path, root: Path) -> bool:
@@ -245,7 +292,9 @@ def is_high_risk_file(path: Path, root: Path) -> bool:
     joined = "/".join(rel_parts(path, root))
     if "management/commands" in joined:
         return True
-    return any(hint in path.name.lower() or f"/{hint}" in joined for hint in HIGH_RISK_FILE_HINTS)
+    # Boundary-aware match so "therapist.py" does not become high-risk via "api",
+    # while "views/detail.py" and "invoice_views.py" still match via "view".
+    return bool(HIGH_RISK_HINT_REGEX.search(joined))
 
 
 def looks_like_settings(path: Path, root: Path, text: str) -> bool:
@@ -273,6 +322,14 @@ def parse_requirements_line(line: str) -> tuple[str, str] | None:
     return name, spec
 
 
+def is_requirements_file(path: Path, root: Path) -> bool:
+    if "requirements" in path.name.lower() and path.suffix in {".txt", ".in"}:
+        return True
+    # requirements/base.txt, requirements/production.in, ...
+    parts = rel_parts(path, root)
+    return len(parts) >= 2 and "requirements" in parts[:-1] and path.suffix in {".txt", ".in"}
+
+
 def collect_package_facts(root: Path) -> dict[str, str]:
     packages: dict[str, str] = {}
     candidate_names = {
@@ -292,20 +349,23 @@ def collect_package_facts(root: Path) -> dict[str, str]:
         "django-tenants",
         "django-tenant-users",
         "django-multitenant",
+        "django-pgschemas",
         "django-tenant-schemas",
         "tenant-schemas-celery",
         "celery",
         "django-redis",
     }
     for path in iter_files(root):
-        if path.name not in candidate_names and "requirements" not in path.name.lower():
+        if path.name not in candidate_names and not is_requirements_file(path, root):
             continue
         text = read_text(path)
+        if not text:
+            continue
         lower = text.lower()
         for pkg in interesting:
             if pkg in lower:
                 packages.setdefault(pkg, "present")
-        if path.name.startswith("requirements"):
+        if is_requirements_file(path, root) or path.name.startswith("requirements"):
             for line in text.splitlines():
                 parsed = parse_requirements_line(line)
                 if parsed and parsed[0] in interesting:
@@ -323,6 +383,8 @@ def detect_stack(packages: dict[str, str], all_text: str) -> list[str]:
     lower = all_text.lower()
     if "django-tenants" in packages or "django_tenants" in lower:
         stack.append("django-tenants / schema-per-tenant")
+    if "django-pgschemas" in packages or "django_pgschemas" in lower:
+        stack.append("django-pgschemas / schema-per-tenant")
     if "django-tenant-users" in packages or "tenant_users" in lower or "django_tenant_users" in lower:
         stack.append("django-tenant-users / global users with tenant permissions")
     if "django-multitenant" in packages or "django_multitenant" in lower:
@@ -335,6 +397,17 @@ def detect_stack(packages: dict[str, str], all_text: str) -> list[str]:
     if not stack and contains_any(lower, TENANT_WORDS):
         stack.append("custom or unknown tenant implementation")
     return stack
+
+
+def resolve_schema_mode(stack: Sequence[str], tenancy: str) -> bool:
+    """True when the ORM heuristics should treat the project as schema-per-tenant."""
+    if tenancy == "schema":
+        return True
+    if tenancy == "shared":
+        return False
+    has_schema = any("schema-per-tenant" in s for s in stack)
+    has_shared = any("shared schema" in s for s in stack)
+    return has_schema and not has_shared
 
 
 def _split_identifier(name: str) -> set[str]:
@@ -364,140 +437,193 @@ def build_vocab(terms: Sequence[str]) -> TenantVocab:
     for t in ordered:
         context += [f"{t}_id", f"{t}=", f"for_{t}", f"request.{t}", f"set_current_{t}", f"get_current_{t}"]
     scoping = tuple(dict.fromkeys(ordered + ("schema", "for_tenant")))
-    field_regex = re.compile(r"\b(" + "|".join(re.escape(t) for t in ordered) + r")\s*=\s*models\.", re.I)
+    field_regex = re.compile(
+        r"\b(" + "|".join(re.escape(t) for t in ordered) + r")(?:_id|_uuid)?\s*=\s*models\.", re.I
+    )
     return TenantVocab(
         terms=ordered,
         context_words=tuple(dict.fromkeys(context)),
         scoping_hints=scoping,
         field_regex=field_regex,
+        context_regex=compile_terms_regex(context),
+        scoping_regex=compile_terms_regex(scoping),
     )
 
 
-def value_is_client_sourced(node: ast.AST) -> bool:
-    dotted = dotted_name(node).lower()
-    if dotted.startswith("self."):
-        dotted = dotted[len("self."):]
-    return dotted.startswith(CLIENT_TENANT_SOURCES)
+def extract_middleware_list(text: str) -> tuple[list[str], int] | None:
+    """Return (middleware entries, lineno) from a settings module using the AST.
+
+    Regex extraction truncated at the first ')' or ']' anywhere — including inside a
+    comment like '# static files (prod)' — silently disabling the order check.
+    """
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return None
+    for node in ast.walk(tree):
+        value = None
+        lineno = getattr(node, "lineno", 1)
+        if isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id == "MIDDLEWARE" for t in node.targets):
+                value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == "MIDDLEWARE":
+                value = node.value
+        if value is not None and isinstance(value, (ast.List, ast.Tuple)):
+            entries = [elt.value for elt in value.elts if isinstance(elt, ast.Constant) and isinstance(elt.value, str)]
+            return entries, lineno
+    return None
 
 
-def audit_settings(path: Path, root: Path, text: str, findings: list[Finding]) -> None:
+def audit_settings_file(path: Path, root: Path, text: str, findings: list[Finding]) -> None:
+    """Per-file settings checks that depend on this file's own contents."""
     if not looks_like_settings(path, root, text):
         return
     rel = relpath(path, root)
-    lower = text.lower()
 
-    uses_django_tenants = "django_tenants" in lower or "django-tenants" in lower
-    if uses_django_tenants:
-        checks = [
-            ("django_tenants.postgresql_backend", "DATABASES default ENGINE should use django_tenants.postgresql_backend."),
-            ("django_tenants.routers.tenantsyncrouter", "DATABASE_ROUTERS should include django_tenants.routers.TenantSyncRouter."),
-            ("shared_apps", "SHARED_APPS should be declared and reviewed."),
-            ("tenant_apps", "TENANT_APPS should be declared and reviewed."),
-            ("tenant_model", "TENANT_MODEL should point to the tenant model."),
-            ("tenant_domain_model", "TENANT_DOMAIN_MODEL should point to the domain model."),
-        ]
-        for needle, message in checks:
-            if needle not in lower:
-                findings.append(Finding(
-                    severity="High",
-                    rule="DT-SETTINGS-MISSING",
-                    path=rel,
-                    line=1,
-                    message=message,
-                    evidence=f"Missing `{needle}` in settings-like file.",
-                    recommendation="Review django-tenants settings: database backend, router, middleware, SHARED_APPS, TENANT_APPS, TENANT_MODEL, and TENANT_DOMAIN_MODEL.",
-                ))
-
-        # Accept either tenant middleware: hostname-based TenantMainMiddleware or the
-        # path-based TenantSubfolderMiddleware (used with TENANT_SUBFOLDER_PREFIX).
-        uses_subfolder = "tenantsubfoldermiddleware" in lower
-        if "tenantmainmiddleware" not in lower and not uses_subfolder:
+    tenant_mw_names = ("TenantMainMiddleware", "TenantSubfolderMiddleware")
+    extracted = extract_middleware_list(text)
+    if extracted:
+        middleware, mw_lineno = extracted
+        tenant_index = next(
+            (i for i, entry in enumerate(middleware) if any(n in entry for n in tenant_mw_names)),
+            None,
+        )
+        if tenant_index is not None and tenant_index > 1:
             findings.append(Finding(
                 severity="High",
-                rule="DT-SETTINGS-MISSING",
+                rule="DT-MIDDLEWARE-ORDER",
                 path=rel,
-                line=1,
-                message="TenantMainMiddleware (or TenantSubfolderMiddleware) should be first or very near the top of MIDDLEWARE.",
-                evidence="No tenant-resolving middleware found in settings-like file.",
-                recommendation="Add django_tenants.middleware.main.TenantMainMiddleware (hostname routing) or django_tenants.middleware.TenantSubfolderMiddleware (subfolder routing) near the top of MIDDLEWARE.",
-            ))
-        if uses_subfolder and "tenant_subfolder_prefix" not in lower:
-            findings.append(Finding(
-                severity="High",
-                rule="DT-SUBFOLDER-PREFIX-MISSING",
-                path=rel,
-                line=1,
-                message="TenantSubfolderMiddleware is used but TENANT_SUBFOLDER_PREFIX was not found.",
-                evidence="TenantSubfolderMiddleware without TENANT_SUBFOLDER_PREFIX.",
-                recommendation="Set TENANT_SUBFOLDER_PREFIX (e.g. 'clients') so subfolder tenant resolution works.",
-            ))
-
-        mw_match = re.search(r"MIDDLEWARE\s*=\s*[\[(](.*?)[\])]", text, flags=re.S)
-        tenant_mw_names = ("TenantMainMiddleware", "TenantSubfolderMiddleware")
-        if mw_match and any(n in mw_match.group(1) for n in tenant_mw_names):
-            middleware_block = mw_match.group(1)
-            non_comment_lines = [ln.strip() for ln in middleware_block.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-            tenant_line_index = next(
-                (i for i, ln in enumerate(non_comment_lines) if any(n in ln for n in tenant_mw_names)),
-                None,
-            )
-            if tenant_line_index is not None and tenant_line_index > 1:
-                findings.append(Finding(
-                    severity="High",
-                    rule="DT-MIDDLEWARE-ORDER",
-                    path=rel,
-                    line=text[:mw_match.start()].count("\n") + 1,
-                    message="Tenant middleware is not at the top of MIDDLEWARE.",
-                    evidence=non_comment_lines[tenant_line_index],
-                    recommendation="Move the tenant middleware before middleware that may touch request, session, auth, URL routing, or database-backed state.",
-                ))
-
-        if "caches" in lower and "key_function" not in lower and "django_tenants.cache.make_key" not in lower:
-            findings.append(Finding(
-                severity="Medium",
-                rule="DT-CACHE-KEY-FUNCTION",
-                path=rel,
-                line=1,
-                message="Cache configuration appears present but no tenant-aware KEY_FUNCTION was found.",
-                evidence="CACHES found without django_tenants.cache.make_key/KEY_FUNCTION.",
-                recommendation="Ensure tenant-specific cache entries include schema/tenant in the key. For django-tenants, consider django_tenants.cache.make_key.",
-            ))
-
-        if "tenantcontextfilter" not in lower and "logging" in lower:
-            findings.append(Finding(
-                severity="Low",
-                rule="DT-LOGGING-CONTEXT",
-                path=rel,
-                line=1,
-                message="Logging is configured but tenant context logging was not detected.",
-                evidence="LOGGING found without TenantContextFilter.",
-                recommendation="Add tenant/schema/domain context to logs for auditability and incident response.",
+                line=mw_lineno,
+                message="Tenant middleware is not at the top of MIDDLEWARE.",
+                evidence=middleware[tenant_index],
+                recommendation="Move the tenant middleware before middleware that may touch request, session, auth, URL routing, or database-backed state.",
             ))
 
     # Match the assignment, not the mere presence of the token: SHOW_PUBLIC_IF_NO_TENANT_FOUND
     # = False plus any other `... = True` in the file used to false-positive here.
-    if re.search(r"SHOW_PUBLIC_IF_NO_TENANT_FOUND\s*=\s*True\b", text):
+    fallback = re.search(r"SHOW_PUBLIC_IF_NO_TENANT_FOUND\s*=\s*True\b", text)
+    if fallback:
         findings.append(Finding(
             severity="Medium",
             rule="DT-PUBLIC-FALLBACK",
             path=rel,
-            line=text[:re.search(r"SHOW_PUBLIC_IF_NO_TENANT_FOUND\s*=\s*True\b", text).start()].count("\n") + 1,
+            line=text[:fallback.start()].count("\n") + 1,
             message="SHOW_PUBLIC_IF_NO_TENANT_FOUND is enabled.",
             evidence="SHOW_PUBLIC_IF_NO_TENANT_FOUND = True",
             recommendation="Confirm this fallback cannot expose tenant-specific routes or confuse tenant resolution. Prefer fail-closed behavior for tenant app routes.",
         ))
 
 
-def audit_python_file(path: Path, root: Path, text: str, findings: list[Finding], vocab: TenantVocab) -> None:
+def audit_settings_union(settings_entries: list[tuple[str, str]], findings: list[Finding]) -> None:
+    """Presence checks across ALL settings-like files combined.
+
+    Split-settings layouts (settings/base.py + settings/production.py) are the dominant
+    real-world shape; running presence checks per file floods every env file with false
+    "missing" findings for keys that live in base.py.
+    """
+    if not settings_entries:
+        return
+    combined = "\n".join(text for _, text in settings_entries)
+    lower = combined.lower()
+    primary_rel = settings_entries[0][0]
+    scope_note = (
+        f"Checked across {len(settings_entries)} settings-like files: "
+        + ", ".join(rel for rel, _ in settings_entries[:5])
+        + ("..." if len(settings_entries) > 5 else "")
+    )
+
+    uses_django_tenants = "django_tenants" in lower or "django-tenants" in lower
+    if not uses_django_tenants:
+        return
+
+    checks = [
+        ("django_tenants.postgresql_backend", "DATABASES default ENGINE should use django_tenants.postgresql_backend."),
+        ("django_tenants.routers.tenantsyncrouter", "DATABASE_ROUTERS should include django_tenants.routers.TenantSyncRouter."),
+        ("shared_apps", "SHARED_APPS should be declared and reviewed."),
+        ("tenant_apps", "TENANT_APPS should be declared and reviewed."),
+        ("tenant_model", "TENANT_MODEL should point to the tenant model."),
+        ("tenant_domain_model", "TENANT_DOMAIN_MODEL should point to the domain model."),
+    ]
+    for needle, message in checks:
+        if needle not in lower:
+            findings.append(Finding(
+                severity="High",
+                rule="DT-SETTINGS-MISSING",
+                path=primary_rel,
+                line=1,
+                message=message,
+                evidence=f"Missing `{needle}` in all settings-like files. {scope_note}",
+                recommendation="Review django-tenants settings: database backend, router, middleware, SHARED_APPS, TENANT_APPS, TENANT_MODEL, and TENANT_DOMAIN_MODEL.",
+            ))
+
+    # Accept either tenant middleware: hostname-based TenantMainMiddleware or the
+    # path-based TenantSubfolderMiddleware (used with TENANT_SUBFOLDER_PREFIX).
+    uses_subfolder = "tenantsubfoldermiddleware" in lower
+    if "tenantmainmiddleware" not in lower and not uses_subfolder:
+        findings.append(Finding(
+            severity="High",
+            rule="DT-SETTINGS-MISSING",
+            path=primary_rel,
+            line=1,
+            message="TenantMainMiddleware (or TenantSubfolderMiddleware) should be first or very near the top of MIDDLEWARE.",
+            evidence=f"No tenant-resolving middleware found. {scope_note}",
+            recommendation="Add django_tenants.middleware.main.TenantMainMiddleware (hostname routing) or django_tenants.middleware.TenantSubfolderMiddleware (subfolder routing) near the top of MIDDLEWARE.",
+        ))
+    if uses_subfolder and "tenant_subfolder_prefix" not in lower:
+        findings.append(Finding(
+            severity="High",
+            rule="DT-SUBFOLDER-PREFIX-MISSING",
+            path=primary_rel,
+            line=1,
+            message="TenantSubfolderMiddleware is used but TENANT_SUBFOLDER_PREFIX was not found.",
+            evidence=f"TenantSubfolderMiddleware without TENANT_SUBFOLDER_PREFIX. {scope_note}",
+            recommendation="Set TENANT_SUBFOLDER_PREFIX (e.g. 'clients') so subfolder tenant resolution works.",
+        ))
+
+    if "caches" in lower and "key_function" not in lower and "django_tenants.cache.make_key" not in lower:
+        findings.append(Finding(
+            severity="Medium",
+            rule="DT-CACHE-KEY-FUNCTION",
+            path=primary_rel,
+            line=1,
+            message="Cache configuration appears present but no tenant-aware KEY_FUNCTION was found.",
+            evidence=f"CACHES found without django_tenants.cache.make_key/KEY_FUNCTION. {scope_note}",
+            recommendation="Ensure tenant-specific cache entries include schema/tenant in the key. For django-tenants, set KEY_FUNCTION to django_tenants.cache.make_key.",
+        ))
+
+    if "tenantcontextfilter" not in lower and "logging" in lower:
+        findings.append(Finding(
+            severity="Low",
+            rule="DT-LOGGING-CONTEXT",
+            path=primary_rel,
+            line=1,
+            message="Logging is configured but tenant context logging was not detected.",
+            evidence=f"LOGGING found without TenantContextFilter. {scope_note}",
+            recommendation="Add tenant/schema/domain context to logs for auditability and incident response.",
+        ))
+
+
+def audit_python_file(
+    path: Path,
+    root: Path,
+    text: str,
+    findings: list[Finding],
+    vocab: TenantVocab,
+    schema_per_tenant: bool,
+) -> None:
     rel = relpath(path, root)
     try:
         tree = ast.parse(text)
-    except SyntaxError as exc:
+    except (SyntaxError, ValueError) as exc:
+        # ValueError: NUL bytes (e.g. UTF-16 sources) raise ValueError instead of
+        # SyntaxError on CPython <= 3.11.
+        lineno = getattr(exc, "lineno", None) or 1
         findings.append(Finding(
             severity="Info",
             rule="PY-SYNTAX-SKIP",
             path=rel,
-            line=exc.lineno or 1,
+            line=lineno,
             message="Could not parse Python file for AST-based checks.",
             evidence=str(exc),
             recommendation="Review manually if this file is relevant to tenant isolation.",
@@ -505,9 +631,25 @@ def audit_python_file(path: Path, root: Path, text: str, findings: list[Finding]
         return
 
     lines = text.splitlines()
+    lower = text.lower()
+    is_test = is_test_file(path, root)
     high_risk = is_high_risk_file(path, root)
     migration = is_migration_file(path, root)
     joined_path = "/".join(rel_parts(path, root))
+
+    has_task_marker = "@shared_task" in text or "@app.task" in text or "celery" in lower
+
+    # SKILL.md code-review heuristics: in schema-per-tenant projects bare ORM lookups are
+    # idiomatic inside tenant-request code (search_path is set by the middleware), so the
+    # ORM/DRF/get_object_or_404 rules only apply to code that can run outside a tenant
+    # request. Shared-schema and unknown stacks keep the strict behavior everywhere.
+    runs_outside_request = (
+        migration
+        or "management/commands" in joined_path
+        or "signal" in path.name.lower()
+        or has_task_marker
+    )
+    orm_rules_active = (not schema_per_tenant) or runs_outside_request
 
     tenant_arg_names = {"schema", "schema_name"}
     for t in vocab.terms:
@@ -516,6 +658,35 @@ def audit_python_file(path: Path, root: Path, text: str, findings: list[Finding]
 
     class_stack: list[str] = []
     function_stack: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+
+    def enclosing_function_is_view() -> bool:
+        """True when kwargs in the enclosing function plausibly carry URL/view kwargs."""
+        if not function_stack:
+            return False
+        fn = function_stack[-1]
+        argnames = [a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs]
+        if "request" in argnames:
+            return True
+        if argnames[:1] == ["self"] and class_stack:
+            return class_stack[-1].endswith(("View", "ViewSet", "APIView"))
+        return False
+
+    def value_is_client_sourced(node: ast.AST) -> bool:
+        dotted = dotted_name(node)
+        segments = [s.lower() for s in dotted.split(".") if s]
+        had_self = bool(segments) and segments[0] == "self"
+        if had_self:
+            segments = segments[1:]
+        if not segments:
+            return False
+        if segments[0] == "request" and len(segments) >= 2 and segments[1] in CLIENT_REQUEST_ATTRS:
+            return True
+        if segments[0] == "kwargs":
+            # self.kwargs is CBV URL kwargs (client-controlled). A bare **kwargs is only
+            # client-sourced in view functions — flagging it inside Celery tasks would
+            # contradict the "pass tenant_id into tasks" recommendation.
+            return had_self or enclosing_function_is_view()
+        return False
 
     class Visitor(ast.NodeVisitor):
         def visit_ClassDef(self, node: ast.ClassDef) -> None:
@@ -580,14 +751,14 @@ def audit_python_file(path: Path, root: Path, text: str, findings: list[Finding]
             evidence = line_at(text, lineno)
             window = context_window(lines, lineno)
             window_lower = window.lower()
-            has_context = contains_any(window, vocab.context_words)
+            has_context = bool(vocab.context_regex.search(window))
 
             # Client-controlled tenant identifier flowing into a query keyword: the exact
             # class TENANT-HEADER warns about, but sourced from GET/POST/data/kwargs.
             for kw in node.keywords:
                 if kw.arg and kw.arg.lower() in tenant_arg_names and value_is_client_sourced(kw.value):
                     findings.append(Finding(
-                        severity="High",
+                        severity="Critical",
                         rule="REQUEST-SOURCED-TENANT-ID",
                         path=rel,
                         line=lineno,
@@ -597,8 +768,9 @@ def audit_python_file(path: Path, root: Path, text: str, findings: list[Finding]
                     ))
                     break
 
-            # Raw SQL bypasses ORM/tenant scoping and search_path assumptions.
-            if high_risk:
+            # Raw SQL bypasses ORM/tenant scoping and search_path assumptions. The call
+            # itself is the signal — do not require a high-risk filename.
+            if not is_test and not migration:
                 raw_kind = None
                 if name.endswith(".raw"):
                     raw_kind = "Model.objects.raw()"
@@ -619,13 +791,13 @@ def audit_python_file(path: Path, root: Path, text: str, findings: list[Finding]
                         recommendation="Confirm the schema/tenant context is set for this connection and scope the query explicitly. Raw SQL is the #1 shared-schema leak vector; add a cross-tenant negative test.",
                     ))
 
-            if high_risk and re.search(
-                r"\.objects\.(all|get|filter|exclude|update|delete|bulk_create|bulk_update|get_or_create|update_or_create|first|last|values|values_list)\b",
+            if orm_rules_active and high_risk and re.search(
+                r"\.objects\.(all|get|create|filter|exclude|update|delete|bulk_create|bulk_update|get_or_create|update_or_create|first|last|values|values_list)\b",
                 name,
             ):
                 method = name.split(".objects.")[-1]
                 high_methods = {"get", "update", "delete", "get_or_create", "update_or_create"}
-                medium_methods = {"all", "bulk_create", "bulk_update", "first", "last", "values", "values_list"}
+                medium_methods = {"all", "create", "bulk_create", "bulk_update", "first", "last", "values", "values_list"}
                 if method in high_methods and not has_context:
                     findings.append(Finding(
                         severity="High",
@@ -646,7 +818,7 @@ def audit_python_file(path: Path, root: Path, text: str, findings: list[Finding]
                         evidence=evidence,
                         recommendation="Scope by tenant/queryset or ensure schema context is already set. Add a cross-tenant negative test for this path.",
                     ))
-                elif method in {"filter", "exclude"} and not contains_any(window, vocab.scoping_hints):
+                elif method in {"filter", "exclude"} and not vocab.scoping_regex.search(window):
                     findings.append(Finding(
                         severity="Medium",
                         rule="ORM-FILTER-NO-TENANT-HINT",
@@ -660,12 +832,13 @@ def audit_python_file(path: Path, root: Path, text: str, findings: list[Finding]
             # Chained bulk mutation, e.g. Model.objects.filter(...).delete() / .update().
             # Manager has no .delete()/.update(); real risk is on the queryset receiver.
             if (
-                high_risk
+                orm_rules_active
+                and high_risk
                 and isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"delete", "update"}
                 and ".objects" in dotted_name(node.func.value)
                 and not has_context
-                and not contains_any(window, vocab.scoping_hints)
+                and not vocab.scoping_regex.search(window)
             ):
                 findings.append(Finding(
                     severity="High",
@@ -677,9 +850,9 @@ def audit_python_file(path: Path, root: Path, text: str, findings: list[Finding]
                     recommendation="Filter by tenant before .update()/.delete(), or ensure schema context is set. Add a cross-tenant negative test.",
                 ))
 
-            if high_risk and name.endswith("get_object_or_404") and not has_context:
+            if orm_rules_active and high_risk and name.endswith("get_object_or_404") and not has_context:
                 call_source = ast.get_source_segment(text, node) or evidence
-                if not contains_any(call_source, vocab.scoping_hints):
+                if not vocab.scoping_regex.search(call_source):
                     findings.append(Finding(
                         severity="High",
                         rule="GET-OBJECT-OR-404-UNSCOPED",
@@ -690,7 +863,7 @@ def audit_python_file(path: Path, root: Path, text: str, findings: list[Finding]
                         recommendation="Use a tenant-scoped queryset, e.g. get_object_or_404(Model.objects.for_tenant(request.tenant), pk=...).",
                     ))
 
-            if high_risk and name.endswith("objects.all") and "queryset" in window_lower and not has_context:
+            if orm_rules_active and high_risk and name.endswith("objects.all") and "queryset" in window_lower and not has_context:
                 findings.append(Finding(
                     severity="High",
                     rule="DRF-GLOBAL-QUERYSET",
@@ -704,24 +877,24 @@ def audit_python_file(path: Path, root: Path, text: str, findings: list[Finding]
             if name in {"cache.get", "cache.set", "cache.add", "cache.get_or_set", "cache.delete", "cache.incr", "cache.decr"}:
                 first_arg = node.args[0] if node.args else None
                 literal = first_arg.value if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str) else None
-                if literal and not contains_any(literal, vocab.scoping_hints):
+                if literal and not vocab.scoping_regex.search(literal):
                     findings.append(Finding(
-                        severity="Medium",
+                        severity="High",
                         rule="CACHE-GLOBAL-KEY",
                         path=rel,
                         line=lineno,
                         message="Cache call uses a static key without tenant/schema hint.",
                         evidence=evidence,
-                        recommendation="Include tenant/schema in cache keys for tenant-specific data, or document that this cache entry is global/public.",
+                        recommendation="Include tenant/schema in cache keys for tenant-specific data (or set a tenant-aware KEY_FUNCTION), or document that this cache entry is global/public.",
                     ))
 
             if name.startswith("models."):
                 for kw in node.keywords:
                     if kw.arg == "upload_to" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
                         upload_to = kw.value.value
-                        if not contains_any(upload_to, vocab.scoping_hints + ("%s", "{}")):
+                        if not vocab.scoping_regex.search(upload_to) and "%s" not in upload_to and "{" not in upload_to:
                             findings.append(Finding(
-                                severity="Medium",
+                                severity="High",
                                 rule="FILE-UPLOAD-GLOBAL-PATH",
                                 path=rel,
                                 line=lineno,
@@ -732,13 +905,13 @@ def audit_python_file(path: Path, root: Path, text: str, findings: list[Finding]
 
             self.generic_visit(node)
 
-        def visit_Assign(self, node: ast.Assign) -> None:
+        def _flag_queryset_assignment(self, node: ast.AST, target_names: list[str]) -> None:
             lineno = getattr(node, "lineno", 1)
             evidence = line_at(text, lineno)
-            target_names = [dotted_name(t) for t in node.targets]
-            if high_risk and any(t.endswith("queryset") or t == "queryset" for t in target_names):
-                value_name = dotted_name(node.value)
-                if value_name.endswith("objects.all") and not contains_any(evidence, vocab.context_words):
+            if orm_rules_active and high_risk and any(t.endswith("queryset") or t == "queryset" for t in target_names):
+                value = getattr(node, "value", None)
+                value_name = dotted_name(value) if value is not None else ""
+                if value_name.endswith("objects.all") and not vocab.context_regex.search(evidence):
                     findings.append(Finding(
                         severity="High",
                         rule="DRF-QUERYSET-ASSIGNMENT",
@@ -748,12 +921,20 @@ def audit_python_file(path: Path, root: Path, text: str, findings: list[Finding]
                         evidence=evidence,
                         recommendation="Use get_queryset() and tenant-scoped managers/querysets for tenant-owned models.",
                     ))
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            self._flag_queryset_assignment(node, [dotted_name(t) for t in node.targets])
+            self.generic_visit(node)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            # queryset: ClassVar[QuerySet] = Model.objects.all() must not evade the rule.
+            if node.value is not None:
+                self._flag_queryset_assignment(node, [dotted_name(node.target)])
             self.generic_visit(node)
 
     Visitor().visit(tree)
 
     # File-level checks that need whole-file context.
-    lower = text.lower()
 
     # Client-supplied tenant header used anywhere (middleware/views), not just settings.
     if "x-tenant-id" in lower or "http_x_tenant" in lower:
@@ -767,9 +948,11 @@ def audit_python_file(path: Path, root: Path, text: str, findings: list[Finding]
             recommendation="Validate any tenant header against authenticated membership; do not trust raw client-supplied tenant identifiers.",
         ))
 
-    if high_risk and ("@shared_task" in text or "@app.task" in text or "celery" in lower):
+    # The task decorator itself is the signal — do not require a high-risk filename
+    # (services/sync.py with @shared_task was previously skipped entirely).
+    if not is_test and has_task_marker:
         has_orm = ".objects." in text
-        has_tenant_context = contains_any(text, vocab.context_words)
+        has_tenant_context = bool(vocab.context_regex.search(text))
         if has_orm and not has_tenant_context:
             findings.append(Finding(
                 severity="High",
@@ -782,7 +965,10 @@ def audit_python_file(path: Path, root: Path, text: str, findings: list[Finding]
             ))
 
     if "management/commands" in joined_path and ".objects." in text:
-        has_command_context = contains_any(text, ("BaseTenantCommand", "tenant_context", "schema_context", "tenant_command", "all_tenants_command", "--schema", "get_tenant_model"))
+        has_command_context = (
+            contains_any(text, ("BaseTenantCommand", "tenant_context", "schema_context", "tenant_command", "all_tenants_command", "--schema", "get_tenant_model"))
+            or bool(vocab.context_regex.search(text))
+        )
         if not has_command_context:
             findings.append(Finding(
                 severity="High",
@@ -794,32 +980,59 @@ def audit_python_file(path: Path, root: Path, text: str, findings: list[Finding]
                 recommendation="Use BaseTenantCommand, tenant_command/all_tenants_command, or explicit validated tenant iteration/context.",
             ))
 
-    if migration and "RunPython" in text and not contains_any(text, ("schema_context", "tenant_context", "migrate_schemas", "get_tenant_model") + vocab.terms):
-        findings.append(Finding(
-            severity="Medium",
-            rule="MIGRATION-RUNPYTHON-NO-TENANT-HINT",
-            path=rel,
-            line=1,
-            message="Data migration uses RunPython without tenant/schema hints.",
-            evidence="RunPython found in migration file without tenant/schema context terms.",
-            recommendation="Confirm whether this migration runs on public schema, tenant schemas, or both. Test on multiple tenants.",
-        ))
+    if migration and "RunPython" in text:
+        has_migration_context = (
+            contains_any(text, ("schema_context", "tenant_context", "migrate_schemas", "get_tenant_model"))
+            or bool(vocab.scoping_regex.search(text))
+        )
+        if not has_migration_context:
+            findings.append(Finding(
+                severity="Medium",
+                rule="MIGRATION-RUNPYTHON-NO-TENANT-HINT",
+                path=rel,
+                line=1,
+                message="Data migration uses RunPython without tenant/schema hints.",
+                evidence="RunPython found in migration file without tenant/schema context terms.",
+                recommendation="Confirm whether this migration runs on public schema, tenant schemas, or both. Test on multiple tenants.",
+            ))
 
 
-def audit_project(root: Path, tenant_terms: Sequence[str] | None = None) -> tuple[ProjectFacts, list[Finding]]:
+def dedupe_findings(findings: list[Finding]) -> list[Finding]:
+    """One defect, one finding: a class-level DRF queryset assignment used to produce
+    DRF-QUERYSET-ASSIGNMENT + DRF-GLOBAL-QUERYSET + ORM-UNSCOPED on the same line."""
+    assignment_lines = {
+        (f.path, f.line) for f in findings if f.rule == "DRF-QUERYSET-ASSIGNMENT"
+    }
+    shadowed = {"DRF-GLOBAL-QUERYSET", "ORM-UNSCOPED-HIGH-RISK", "ORM-FILTER-NO-TENANT-HINT"}
+    return [
+        f for f in findings
+        if not (f.rule in shadowed and (f.path, f.line) in assignment_lines)
+    ]
+
+
+def audit_project(
+    root: Path,
+    tenant_terms: Sequence[str] | None = None,
+    tenancy: str = "auto",
+) -> tuple[ProjectFacts, list[Finding]]:
     findings: list[Finding] = []
     packages = collect_package_facts(root)
 
     all_text_parts: list[str] = []
     settings_files: list[str] = []
+    settings_entries: list[tuple[str, str]] = []
     py_files: list[tuple[Path, str]] = []
+    test_texts: list[str] = []
     py_count = 0
     test_count = 0
-    tenant_terms_in_tests = False
 
     for path in iter_files(root):
         # Keep all text bounded enough for detection; skip huge locks after package collection.
-        if path.stat().st_size > 2_000_000:
+        try:
+            if path.stat().st_size > 2_000_000:
+                continue
+        except OSError:
+            # Broken symlink, permission denied, or file deleted mid-scan: skip, don't crash.
             continue
         text = read_text(path)
         all_text_parts.append(text[:100_000])
@@ -828,13 +1041,15 @@ def audit_project(root: Path, tenant_terms: Sequence[str] | None = None) -> tupl
             py_files.append((path, text))
             if is_test_file(path, root):
                 test_count += 1
-                if contains_any(text, ("TenantTestCase", "TenantClient", "tenant_a", "tenant_b", "schema_context", "tenant_context", "for_tenant")):
-                    tenant_terms_in_tests = True
+                test_texts.append(text)
             if looks_like_settings(path, root, text):
-                settings_files.append(relpath(path, root))
+                rel = relpath(path, root)
+                settings_files.append(rel)
+                settings_entries.append((rel, text))
 
     all_text = "\n".join(all_text_parts)
     stack = detect_stack(packages, all_text)
+    schema_mode = resolve_schema_mode(stack, tenancy)
 
     if tenant_terms:
         effective_terms: tuple[str, ...] = tuple(dict.fromkeys(t.lower() for t in tenant_terms))
@@ -842,9 +1057,20 @@ def audit_project(root: Path, tenant_terms: Sequence[str] | None = None) -> tupl
         effective_terms = infer_tenant_terms(all_text, DEFAULT_TENANT_TERMS)
     vocab = build_vocab(effective_terms)
 
+    # Tenant-test detection must honor the configured/inferred vocabulary: a project whose
+    # tests create workspace_a/workspace_b is tenant-tested even if it never says "tenant".
+    fixed_test_markers = ("TenantTestCase", "TenantClient", "schema_context", "tenant_context", "for_tenant")
+    term_test_markers = tuple(f"{t}_a" for t in vocab.terms) + tuple(f"{t}_b" for t in vocab.terms)
+    tenant_terms_in_tests = any(
+        contains_any(text, fixed_test_markers + term_test_markers)
+        or bool(vocab.context_regex.search(text))
+        for text in test_texts
+    )
+
+    audit_settings_union(settings_entries, findings)
     for path, text in py_files:
-        audit_settings(path, root, text, findings)
-        audit_python_file(path, root, text, findings, vocab)
+        audit_settings_file(path, root, text, findings)
+        audit_python_file(path, root, text, findings, vocab, schema_mode)
 
     if stack and py_count and test_count == 0:
         findings.append(Finding(
@@ -856,7 +1082,7 @@ def audit_project(root: Path, tenant_terms: Sequence[str] | None = None) -> tupl
             evidence=", ".join(stack),
             recommendation="Add tenant A/B isolation tests for APIs, admin, tasks, cache, and files.",
         ))
-    elif stack and not tenant_terms_in_tests:
+    elif stack and py_count and not tenant_terms_in_tests:
         findings.append(Finding(
             severity="High",
             rule="TENANT-TESTS-NOT-DETECTED",
@@ -892,10 +1118,13 @@ def audit_project(root: Path, tenant_terms: Sequence[str] | None = None) -> tupl
             recommendation="Confirm this legacy dependency is intentionally supported. For new builds, evaluate django-tenants.",
         ))
 
+    findings = dedupe_findings(findings)
+
     facts = ProjectFacts(
         root=str(root),
         packages=packages,
         detected_stack=stack,
+        tenancy_mode="schema-per-tenant" if schema_mode else "shared-schema-or-unknown",
         settings_files=settings_files,
         tenant_terms=list(vocab.terms),
         python_files_scanned=py_count,
@@ -917,6 +1146,7 @@ def render_markdown(facts: ProjectFacts, findings: list[Finding]) -> str:
     lines.append(f"Root: `{facts.root}`")
     lines.append(f"Python files scanned: {facts.python_files_scanned}")
     lines.append(f"Test files scanned: {facts.test_files_scanned}")
+    lines.append(f"Tenancy mode for ORM heuristics: {facts.tenancy_mode}")
     lines.append(f"Tenant terms used: {', '.join(facts.tenant_terms) if facts.tenant_terms else '(none)'}")
     lines.append(f"Tenant-isolation test terms detected: {'yes' if facts.tenant_terms_in_tests else 'no'}")
     lines.append("")
@@ -971,8 +1201,19 @@ def render_markdown(facts: ProjectFacts, findings: list[Finding]) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Static audit for Django multi-tenant isolation risks.")
     parser.add_argument("--root", default=".", help="Project root to scan. Default: current directory.")
-    parser.add_argument("--format", choices={"markdown", "json"}, default="markdown", help="Output format.")
-    parser.add_argument("--fail-on", choices=["Critical", "High", "Medium", "Low", "Info"], help="Exit non-zero if any finding at or above this severity exists.")
+    parser.add_argument("--format", choices=("markdown", "json"), default="markdown", help="Output format.")
+    parser.add_argument("--fail-on", choices=("Critical", "High", "Medium", "Low", "Info"), help="Exit non-zero if any finding at or above this severity exists.")
+    parser.add_argument(
+        "--tenancy",
+        choices=("auto", "schema", "shared"),
+        default="auto",
+        help=(
+            "Tenancy model assumption for the ORM heuristics. 'schema' = schema-per-tenant "
+            "(bare ORM calls in request-path code are idiomatic; only outside-request code is "
+            "flagged). 'shared' = shared-schema (strict scoping everywhere). Default 'auto' "
+            "detects from packages/imports."
+        ),
+    )
     parser.add_argument(
         "--tenant-term",
         "--tenant-field",
@@ -994,7 +1235,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: root does not exist: {root}", file=sys.stderr)
         return 2
 
-    facts, findings = audit_project(root, args.tenant_terms)
+    facts, findings = audit_project(root, args.tenant_terms, args.tenancy)
 
     if args.format == "json":
         print(json.dumps({"facts": asdict(facts), "findings": [asdict(f) for f in findings]}, indent=2, sort_keys=True))

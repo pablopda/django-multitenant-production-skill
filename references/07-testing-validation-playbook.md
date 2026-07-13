@@ -1,5 +1,21 @@
 # Testing and Validation Playbook
 
+## Contents
+
+- Test pyramid
+- Required tenant fixtures
+- Schema-per-tenant tests
+- pytest fixtures for django-tenants
+- Shared-schema tests
+- API validation checklist
+- Admin validation checklist
+- Async validation checklist
+- Cache/session validation checklist
+- File validation checklist
+- Migration validation checklist
+- Static audit command
+- Acceptance language
+
 Multi-tenant testing must prove negative cases. A happy-path test in one tenant is not enough.
 
 ## Test pyramid
@@ -44,6 +60,42 @@ class TenantIsolationTests(TenantTestCase):
 
 For cross-tenant cases, create a second tenant and use `tenant_context` to seed its data.
 
+## pytest fixtures for django-tenants
+
+Schema creation per test is expensive: each tenant save triggers `migrate_schemas` for that schema. Standard pattern: override pytest-django's `django_db_setup` to provision tenant A/B schemas once per session, then wrap per-test data in `schema_context`/`tenant_context`.
+
+```python
+# conftest.py — sketch, adapt tenant/domain models and domains to your project
+import pytest
+from customers.models import Client, Domain  # your tenant/domain models
+
+def _make_tenant(schema_name, domain):
+    tenant, _ = Client.objects.get_or_create(schema_name=schema_name, defaults={"name": schema_name})
+    Domain.objects.get_or_create(tenant=tenant, domain=domain, is_primary=True)
+    return tenant
+
+@pytest.fixture(scope="session")
+def django_db_setup(django_db_setup, django_db_blocker):
+    # Provision both schemas once per session (auto_create_schema runs the migrations).
+    with django_db_blocker.unblock():
+        _make_tenant("tenant_a", "tenant-a.example.com")
+        _make_tenant("tenant_b", "tenant-b.example.com")
+
+@pytest.fixture(scope="session")
+def tenant_a(django_db_setup, django_db_blocker):
+    with django_db_blocker.unblock():
+        return Client.objects.get(schema_name="tenant_a")
+
+# tenant_b: same pattern
+
+@pytest.fixture
+def tenant_client(tenant_a):
+    from django_tenants.test.client import TenantClient
+    return TenantClient(tenant_a)  # or set api_client.defaults["HTTP_HOST"] to the tenant domain
+```
+
+Seed per-test data inside `schema_context(tenant_a.schema_name)` / `tenant_context(tenant_a)` so it lands in the right schema. Shared-schema mode needs none of this: plain factories with a tenant FK suffice.
+
 ## Shared-schema tests
 
 Every tenant-owned API/viewset needs negative cases:
@@ -51,10 +103,15 @@ Every tenant-owned API/viewset needs negative cases:
 ```python
 def test_user_cannot_retrieve_other_tenant_object(api_client, tenant_a, tenant_b, user_a, project_b):
     api_client.force_authenticate(user_a)
-    api_client.set_tenant(tenant_a)
+    # Route the request to tenant A. For domain-resolved tenants:
+    api_client.defaults["HTTP_HOST"] = "tenant-a.example.com"
+    # For session- or header-resolved tenants, call your project's tenant-selection
+    # helper instead (project-defined; there is no set_tenant on Django/DRF test clients).
     response = api_client.get(f"/api/projects/{project_b.pk}/")
     assert response.status_code in {403, 404}
 ```
+
+See templates/shared_schema_isolation_test_template.py for starter tests; its `route_to_tenant()` helper is the place to plug in whichever mechanism (host, session, header) your middleware implements.
 
 ## API validation checklist
 
@@ -84,6 +141,7 @@ For each tenant-owned endpoint:
 - task cannot mutate object from another tenant if passed mismatched tenant/object IDs
 - scheduled jobs iterate all active tenants intentionally
 - retries preserve tenant context
+- task teardown clears tenant context; the next task on the same worker starts clean
 
 ## Cache/session validation checklist
 
@@ -91,6 +149,7 @@ For each tenant-owned endpoint:
 - switching active tenant invalidates/reloads tenant-specific permission cache
 - suspended/deleted membership prevents session reuse
 - rate limits/quotas are tenant-scoped where required
+- request without tenant context (anonymous, or immediately after a tenant-A request on the same worker/thread) sees no leftover tenant — regression test for thread-local/contextvar leaks (see references/04 middleware caveat)
 
 ## File validation checklist
 

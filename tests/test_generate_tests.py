@@ -56,6 +56,31 @@ class GenerateTests(unittest.TestCase):
             self.assertEqual(code, 0, err)
             self.assertTrue((Path(tmp) / "app" / "tests" / "test_isolation.py").exists())
 
+    def test_schema_mode_makes_tests_dir_a_package(self):
+        # Since Python 3.11 unittest discovery skips non-package dirs, so without
+        # __init__.py the generated fail-loudly tests would silently never run
+        # under manage.py test — the exact vacuous-green outcome they exist to prevent.
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _, err = run_main("--root", tmp, "--mode", "schema")
+            self.assertEqual(code, 0, err)
+            self.assertTrue((Path(tmp) / "tests" / "__init__.py").exists())
+
+    def test_shared_mode_does_not_force_init(self):
+        # pytest collects without __init__.py; forcing one can change rootdir semantics.
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _, err = run_main("--root", tmp, "--mode", "shared")
+            self.assertEqual(code, 0, err)
+            self.assertFalse((Path(tmp) / "tests" / "__init__.py").exists())
+
+    def test_output_cannot_escape_root(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as other:
+            for output in (f"{other}/evil.py", "../escaped.py"):
+                code, _, err = run_main("--root", tmp, "--mode", "schema", "--output", output)
+                self.assertEqual(code, 2, f"--output {output} must be rejected: {err}")
+                self.assertIn("inside --root", err)
+            self.assertFalse((Path(other) / "evil.py").exists())
+            self.assertFalse((Path(tmp).parent / "escaped.py").exists())
+
 
 class TemplateTests(unittest.TestCase):
     def test_python_templates_compile(self):

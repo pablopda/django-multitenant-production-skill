@@ -61,6 +61,27 @@ Rejected alternatives:
 - [ ] feature flags if needed
 - [ ] rollback/backout plan
 
+## Migration commands
+
+Exact commands and order for this change (adapt per tenancy model):
+
+```bash
+# example for django-tenants:
+# python manage.py makemigrations
+# python manage.py migrate_schemas --shared
+# python manage.py migrate_schemas            # add --executor multiprocessing for many tenants
+```
+
+## Rollout and backout
+
+Rollout steps:
+
+1. 
+
+Backout procedure (before and after the point of no return):
+
+1. 
+
 ## Acceptance criteria
 
 - 
