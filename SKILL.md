@@ -207,7 +207,7 @@ Bundled tooling lives under this skill's `scripts/` and `templates/` directories
 - **Evaluate** — `scripts/tenant_static_audit.py`: AST/regex audit for tenant-isolation smells. `--root <project_root>` selects the project to scan (not the skill dir); `--format json` for machine output; `--fail-on <Critical|High|Medium|Low|Info>` exits non-zero for CI gating.
 - **Validate** — `scripts/generate_tenant_isolation_tests.py`: emits a cross-tenant negative-test skeleton. `--mode schema|shared` (required) picks the template; `--output <path>` and `--force` control the target file. Treat generated tests as scaffolds to complete, not proof.
 - **Build** — `scripts/scaffold_django_tenants_app.py`: scaffolds a `django-tenants` tenant/domain app and provisioning command. `--app`, `--tenant-model`, `--domain-model`, `--force`; run with the project root as `--root`.
-- **Report/plan templates** — `templates/validation-report.md`, `templates/adr-tenancy-decision.md`, `templates/implementation-plan.md`, and the two isolation-test templates.
+- **Report/plan templates** — `templates/validation-report.md`, `templates/adr-tenancy-decision.md`, `templates/implementation-plan.md`, and the two isolation-test templates (`templates/schema_tenant_isolation_test_template.py`, `templates/shared_schema_isolation_test_template.py`).
 
 ## Completion standard
 
