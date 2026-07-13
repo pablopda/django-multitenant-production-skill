@@ -7,9 +7,7 @@ Silent (exit 0, no output) in projects without a recognized multi-tenant stack.
 
 from __future__ import annotations
 
-import json
 import os
-import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -35,19 +33,10 @@ def main() -> int:
         if not project.is_dir():
             return 0
 
-        audit_script = _common.plugin_root() / "scripts" / "tenant_static_audit.py"
-        if not audit_script.is_file():
+        audited = _common.run_audit(project)
+        if audited is None:
             return 0
-
-        result = subprocess.run(
-            [sys.executable, str(audit_script), "--root", str(project), "--format", "json"],
-            capture_output=True,
-            text=True,
-            timeout=25,
-        )
-        if result.returncode not in (0, 1):
-            return 0
-        report = json.loads(result.stdout)
+        _, report = audited
         stack = report.get("facts", {}).get("detected_stack", [])
         packages = report.get("facts", {}).get("packages", {})
 
@@ -64,7 +53,7 @@ def main() -> int:
                 pass
             return 0
 
-        _common.baseline_path(project).write_text(result.stdout, encoding="utf-8")
+        _common.write_baseline(project, report)
 
         tenancy_mode = report.get("facts", {}).get("tenancy_mode", "")
         schema_mode = tenancy_mode == "schema-per-tenant"

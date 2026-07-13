@@ -147,6 +147,43 @@ class AuditOnEditHookTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.stdout.strip(), "")
 
+    def test_unreported_findings_in_other_files_are_not_absorbed(self):
+        # A finding introduced outside the Edit/Write hooks (e.g. a file created via
+        # Bash) must still be reported the first time ITS file is edited — an edit to
+        # an unrelated file in between must not silently absorb it into the baseline.
+        with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as data:
+            root = Path(project)
+            build_django_tenants_fixture(root)
+            run_hook("session_start_tenancy.py", {"cwd": project}, data)
+
+            bad = write_fixture(root, "shop/tasks.py", """\
+                from celery import shared_task
+
+                from .models import Product
+
+
+                @shared_task
+                def refresh(product_id):
+                    return Product.objects.get(pk=product_id).name
+            """)
+            unrelated = write_fixture(root, "shop/other.py", "VALUE = 1\n")
+
+            first = run_hook(
+                "audit_on_edit.py",
+                {"tool_input": {"file_path": str(unrelated)}, "cwd": project},
+                data,
+            )
+            self.assertEqual(first.stdout.strip(), "", "unrelated edit must not report tasks.py")
+
+            second = run_hook(
+                "audit_on_edit.py",
+                {"tool_input": {"file_path": str(bad)}, "cwd": project},
+                data,
+            )
+            self.assertTrue(second.stdout.strip(), "the finding must still be reported for its own file")
+            context = json.loads(second.stdout)["hookSpecificOutput"]["additionalContext"]
+            self.assertIn("ASYNC-NO-TENANT-CONTEXT", context)
+
     def test_silent_for_non_python_files(self):
         with tempfile.TemporaryDirectory() as project, tempfile.TemporaryDirectory() as data:
             result = run_hook("audit_on_edit.py", {"tool_input": {"file_path": f"{project}/notes.md"}, "cwd": project}, data)
@@ -155,15 +192,18 @@ class AuditOnEditHookTests(unittest.TestCase):
 
 
 class GuardMigrateHookTests(unittest.TestCase):
-    def setUp(self):
-        self._project = tempfile.TemporaryDirectory()
-        self._data = tempfile.TemporaryDirectory()
-        build_django_tenants_fixture(Path(self._project.name))
-        run_hook("session_start_tenancy.py", {"cwd": self._project.name}, self._data.name)
+    @classmethod
+    def setUpClass(cls):
+        # The fixture and baseline are read-only for every test here: provision once.
+        cls._project = tempfile.TemporaryDirectory()
+        cls._data = tempfile.TemporaryDirectory()
+        build_django_tenants_fixture(Path(cls._project.name))
+        run_hook("session_start_tenancy.py", {"cwd": cls._project.name}, cls._data.name)
 
-    def tearDown(self):
-        self._project.cleanup()
-        self._data.cleanup()
+    @classmethod
+    def tearDownClass(cls):
+        cls._project.cleanup()
+        cls._data.cleanup()
 
     def guard(self, command: str) -> subprocess.CompletedProcess:
         payload = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": self._project.name}

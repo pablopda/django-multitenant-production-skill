@@ -12,9 +12,7 @@ Critical/High findings, or anything at all goes wrong.
 
 from __future__ import annotations
 
-import json
 import os
-import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -43,16 +41,10 @@ def main() -> int:
         if rel.startswith(".."):
             return 0  # Edited file lives outside the project.
 
-        audit_script = _common.plugin_root() / "scripts" / "tenant_static_audit.py"
-        result = subprocess.run(
-            [sys.executable, str(audit_script), "--root", str(project), "--format", "json"],
-            capture_output=True,
-            text=True,
-            timeout=25,
-        )
-        if result.returncode not in (0, 1):
+        audited = _common.run_audit(project)
+        if audited is None:
             return 0
-        report = json.loads(result.stdout)
+        _, report = audited
 
         known = {_common.finding_key(f) for f in baseline.get("findings", [])}
         fresh = [
@@ -62,9 +54,14 @@ def main() -> int:
             and _common.finding_key(f) not in known
         ]
 
-        # Refresh the baseline either way: a reported finding is reported once, and
-        # fixed findings drop out so they re-report if they ever come back.
-        _common.baseline_path(project).write_text(result.stdout, encoding="utf-8")
+        # Refresh the baseline for the EDITED FILE ONLY: reported findings report once,
+        # and fixed ones drop out so they re-report if they come back. Absorbing the
+        # full report would mark findings in OTHER files as known without ever having
+        # reported them — they would then stay silent forever.
+        merged = [f for f in baseline.get("findings", []) if f.get("path") != rel]
+        merged.extend(f for f in report.get("findings", []) if f.get("path") == rel)
+        baseline["findings"] = merged
+        _common.write_baseline(project, baseline)
 
         if not fresh:
             return 0

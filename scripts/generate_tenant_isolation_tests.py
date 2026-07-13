@@ -44,6 +44,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         # ../-traversal silently escaping the project is never what the user meant.
         print(f"error: --output must stay inside --root: {output}", file=sys.stderr)
         return 2
+    if output == root or output.is_dir():
+        print(f"error: --output must be a file path, not a directory: {output}", file=sys.stderr)
+        return 2
     if output.exists() and not args.force:
         print(f"error: output exists; use --force to overwrite: {output}", file=sys.stderr)
         return 2
@@ -55,10 +58,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Since Python 3.11 unittest discovery skips directories that are not importable
         # packages, so a tests/ dir without __init__.py silently never runs — the exact
         # vacuous-green outcome the fail-loudly guards exist to prevent.
+        # output was validated to resolve inside root, so walking parents terminates.
         package_dir = output.parent
-        while root in package_dir.parents or package_dir == root:
-            if package_dir == root:
-                break
+        while package_dir != root:
             init_file = package_dir / "__init__.py"
             if not init_file.exists():
                 init_file.write_text("", encoding="utf-8")

@@ -112,6 +112,13 @@ class ScaffoldTests(unittest.TestCase):
             self.assertTrue((Path(tmp) / "apps" / "__init__.py").exists(),
                             "intermediate dirs must be regular packages, not namespace packages")
 
+    def test_dotted_app_component_colliding_with_file_errors_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "platform").write_text("not a directory\n", encoding="utf-8")
+            code, _, err = run_main("--root", tmp, "--app", "platform.tenants")
+            self.assertEqual(code, 2, "path collision must be a clean error, not a traceback")
+            self.assertIn("error:", err)
+
     def test_rerun_prints_skip_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_main("--root", tmp, "--app", "customers")

@@ -72,6 +72,15 @@ class GenerateTests(unittest.TestCase):
             self.assertEqual(code, 0, err)
             self.assertFalse((Path(tmp) / "tests" / "__init__.py").exists())
 
+    def test_output_must_be_a_file_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _, err = run_main("--root", tmp, "--mode", "schema", "--output", ".")
+            self.assertEqual(code, 2, "--output pointing at root must be rejected")
+            (Path(tmp) / "sub").mkdir()
+            code, _, err = run_main("--root", tmp, "--mode", "schema", "--output", "sub", "--force")
+            self.assertEqual(code, 2, "--output pointing at a directory must be rejected")
+            self.assertIn("not a directory", err)
+
     def test_output_cannot_escape_root(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as other:
             for output in (f"{other}/evil.py", "../escaped.py"):

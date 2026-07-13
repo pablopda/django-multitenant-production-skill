@@ -313,23 +313,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     root = Path(args.root).resolve()
     app_dir = root.joinpath(*args.app.split("."))
 
-    # Intermediate directories of a dotted app path need __init__.py so the app is a
-    # regular package (implicit namespace packages break find_packages() and surprise
-    # tooling).
-    parts = args.app.split(".")
-    for depth in range(1, len(parts)):
-        parent_init = root.joinpath(*parts[:depth]) / "__init__.py"
-        if not parent_init.exists():
-            write_file(parent_init, "", force=False)
+    try:
+        # Intermediate directories of a dotted app path need __init__.py so the app is a
+        # regular package (implicit namespace packages break find_packages() and surprise
+        # tooling).
+        parts = args.app.split(".")
+        for depth in range(1, len(parts)):
+            parent_init = root.joinpath(*parts[:depth]) / "__init__.py"
+            if not parent_init.exists():
+                write_file(parent_init, "", force=False)
 
-    files = build_files(args.app, args.tenant_model, args.domain_model)
-    wrote = 0
-    skipped = 0
-    for relative, content in files.items():
-        if write_file(app_dir / relative, content, force=args.force):
-            wrote += 1
-        else:
-            skipped += 1
+        files = build_files(args.app, args.tenant_model, args.domain_model)
+        wrote = 0
+        skipped = 0
+        for relative, content in files.items():
+            if write_file(app_dir / relative, content, force=args.force):
+                wrote += 1
+            else:
+                skipped += 1
+    except OSError as exc:
+        # e.g. a dotted-app path component already exists as a regular file.
+        print(f"error: cannot write scaffold: {exc}", file=sys.stderr)
+        return 2
 
     if skipped:
         print(f"\nSummary: wrote {wrote} files, skipped {skipped} existing files (use --force to overwrite).")

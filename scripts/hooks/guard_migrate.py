@@ -20,7 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _common  # noqa: E402
 
 # manage.py migrate / django-admin migrate, but not migrate_schemas and not --help.
-BARE_MIGRATE = re.compile(r"(?:manage\.py|django-admin)\s+migrate(?!\w|_schemas)\b")
+# (?!\w) already rejects the '_' of migrate_schemas.
+BARE_MIGRATE = re.compile(r"(?:manage\.py|django-admin)\s+migrate(?!\w)")
 
 
 def main() -> int:

@@ -63,6 +63,59 @@ class SchemaModeHeuristicsTests(unittest.TestCase):
         _, findings = audit.audit_project(self.root, tenancy="shared")
         self.assertIn("GET-OBJECT-OR-404-UNSCOPED", rules_at(findings, "shop/views.py"))
 
+    def test_celery_import_does_not_flip_request_files_to_strict_mode(self):
+        # Importing celery.result for task-status polling (or mentioning celery in a
+        # comment) must not classify a request-path view as task code.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_django_tenants_fixture(root)
+            write_fixture(root, "shop/status_views.py", """\
+                from celery.result import AsyncResult
+
+                from .models import Product
+
+
+                def export_status(request, pk):
+                    # celery result polling for the export job
+                    product = Product.objects.get(pk=pk)
+                    return AsyncResult(str(product.pk))
+            """)
+            _, findings = audit.audit_project(root)
+            noisy = rules_at(findings, "status_views.py") & {
+                "ORM-UNSCOPED-HIGH-RISK", "ASYNC-NO-TENANT-CONTEXT",
+            }
+            self.assertFalse(noisy, f"celery import flipped a view file to strict mode: {noisy}")
+
+    def test_signals_package_is_covered_in_schema_mode(self):
+        # The standard signals/ package layout must get the outside-request rules,
+        # not just files literally named *signals.py.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_django_tenants_fixture(root)
+            write_fixture(root, "app/signals/billing.py", """\
+                from django.db.models.signals import post_save
+                from django.dispatch import receiver
+
+                from shop.models import LedgerEntry
+
+
+                @receiver(post_save)
+                def on_save(sender, instance, **extra):
+                    LedgerEntry.objects.get_or_create(source_id=instance.pk)
+            """)
+            _, findings = audit.audit_project(root)
+            self.assertIn("ORM-UNSCOPED-HIGH-RISK", rules_at(findings, "app/signals/billing.py"))
+
+    def test_prose_mention_of_shared_package_does_not_demote_schema_mode(self):
+        # A README comparing django-multitenant must not flip a real django-tenants
+        # project (declared in requirements) into strict shared-schema mode.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_django_tenants_fixture(root)
+            write_fixture(root, "README.md", "We evaluated django_multitenant and chose django-tenants instead.\n")
+            facts, _ = audit.audit_project(root)
+            self.assertEqual(facts.tenancy_mode, "schema-per-tenant")
+
 
 class CrashRobustnessTests(unittest.TestCase):
     def test_dangling_symlink_does_not_crash(self):
@@ -120,6 +173,64 @@ class SettingsTests(unittest.TestCase):
             missing = [f for f in findings if f.rule == "DT-SETTINGS-MISSING"]
             self.assertFalse(missing, f"split settings produced false missing-settings findings: {missing}")
 
+    def test_middleware_order_check_handles_list_concatenation(self):
+        # MIDDLEWARE = [...] + ["...TenantMainMiddleware"] is a common split-settings
+        # idiom; the flattener must still compute the tenant middleware's position.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, "config/settings.py", """\
+                INSTALLED_APPS = ["django_tenants"]
+                DATABASES = {"default": {"ENGINE": "django_tenants.postgresql_backend"}}
+                MIDDLEWARE = [
+                    "django.middleware.security.SecurityMiddleware",
+                    "django.contrib.sessions.middleware.SessionMiddleware",
+                ] + ["django_tenants.middleware.main.TenantMainMiddleware"]
+            """)
+            _, findings = audit.audit_project(root)
+            self.assertIn("DT-MIDDLEWARE-ORDER", {f.rule for f in findings})
+
+    def test_middleware_starred_unpacking_degrades_without_wrong_verdict(self):
+        # [*BASE, tenant] with BASE unresolvable must not crash and must not
+        # miscount the tenant middleware as being at index 0.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, "config/settings.py", """\
+                INSTALLED_APPS = ["django_tenants"]
+                DATABASES = {"default": {"ENGINE": "django_tenants.postgresql_backend"}}
+                BASE_MIDDLEWARE = ["django.middleware.security.SecurityMiddleware"]
+                MIDDLEWARE = [*BASE_MIDDLEWARE, "django_tenants.middleware.main.TenantMainMiddleware"]
+            """)
+            audit.audit_project(root)  # must not raise
+
+    def test_settings_snippet_files_do_not_satisfy_union_checks(self):
+        # An un-merged scaffold snippet must not silence DT-SETTINGS-MISSING for the
+        # real (incomplete) settings module.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, "requirements.txt", "django-tenants==3.10.2\n")
+            # Real settings: missing the router.
+            write_fixture(root, "config/settings.py", """\
+                INSTALLED_APPS = ["django_tenants", "customers"]
+                DATABASES = {"default": {"ENGINE": "django_tenants.postgresql_backend"}}
+                MIDDLEWARE = ["django_tenants.middleware.main.TenantMainMiddleware"]
+                SHARED_APPS = ["django_tenants", "customers"]
+                TENANT_APPS = ["app"]
+                TENANT_MODEL = "customers.Client"
+                TENANT_DOMAIN_MODEL = "customers.Domain"
+            """)
+            # Scaffold snippet that DOES declare a router; it must not count.
+            write_fixture(root, "customers/settings_django_tenants_snippet.py", """\
+                DATABASE_ROUTERS = ("django_tenants.routers.TenantSyncRouter",)
+                SHARED_APPS = ["django_tenants"]
+                TENANT_APPS = []
+            """)
+            _, findings = audit.audit_project(root)
+            router_missing = [
+                f for f in findings
+                if f.rule == "DT-SETTINGS-MISSING" and "router" in f.message.lower()
+            ]
+            self.assertTrue(router_missing, "snippet file silenced the missing-router check")
+
     def test_middleware_order_check_survives_paren_in_comment(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -161,6 +272,27 @@ class DetectionTests(unittest.TestCase):
             self.assertNotIn("TESTS-NOT-DETECTED", rules)
             self.assertNotIn("TENANT-TESTS-NOT-DETECTED", rules)
 
+    def test_conventional_fixture_names_survive_custom_tenant_term(self):
+        # --tenant-term workspace must not stop tenant_a/tenant_b fixtures from
+        # counting as tenant-isolation tests.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, "requirements.txt", "django-multitenant==4.1.1\n")
+            write_fixture(root, "app/models.py", """\
+                from django.db import models
+
+
+                class Project(models.Model):
+                    workspace = models.ForeignKey("core.Workspace", on_delete=models.CASCADE)
+            """)
+            write_fixture(root, "tests/test_isolation.py", """\
+                def test_cross_tenant_denied(tenant_a, tenant_b):
+                    assert tenant_a != tenant_b
+            """)
+            facts, findings = audit.audit_project(root, tenant_terms=["workspace"])
+            self.assertTrue(facts.tenant_terms_in_tests)
+            self.assertNotIn("TENANT-TESTS-NOT-DETECTED", {f.rule for f in findings})
+
     def test_custom_tenant_term_recognized_in_tests(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -201,6 +333,11 @@ class DetectionTests(unittest.TestCase):
         self.assertTrue(audit.is_high_risk_file(Path("/repo/app/views/detail.py"), root))
         self.assertTrue(audit.is_high_risk_file(Path("/repo/app/invoice_views.py"), root))
         self.assertTrue(audit.is_high_risk_file(Path("/repo/app/signals.py"), root))
+        # Compound names with no separator keep the v1.1.0 coverage.
+        self.assertTrue(audit.is_high_risk_file(Path("/repo/app/restapi.py"), root))
+        self.assertTrue(audit.is_high_risk_file(Path("/repo/app/myviews.py"), root))
+        self.assertTrue(audit.is_high_risk_file(Path("/repo/app/asynctasks.py"), root))
+        self.assertTrue(audit.is_high_risk_file(Path("/repo/app/management/commands/report.py"), root))
 
 
 class SeverityAndPrecisionTests(unittest.TestCase):
@@ -289,6 +426,60 @@ class ClientSourcedPrecisionTests(unittest.TestCase):
                 return list(Invoice.objects.filter(status="open"))
         """)
         self.assertIn("ORM-FILTER-NO-TENANT-HINT", rules)
+
+    def test_multiline_queryset_assignment_dedupes(self):
+        # Assign node and Call node carry different line numbers when the value is
+        # parenthesized across lines; dedupe must still collapse to one finding.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, "app/api.py", """\
+                from rest_framework.viewsets import ModelViewSet
+
+                from .models import Invoice
+
+
+                class InvoiceViewSet(ModelViewSet):
+                    queryset = (
+                        Invoice.objects.all()
+                    )
+            """)
+            _, findings = audit.audit_project(root)
+            related = [
+                f for f in findings
+                if f.path.endswith("api.py") and f.rule in {
+                    "DRF-QUERYSET-ASSIGNMENT", "DRF-GLOBAL-QUERYSET",
+                    "ORM-UNSCOPED-HIGH-RISK", "ORM-FILTER-NO-TENANT-HINT",
+                }
+            ]
+            self.assertEqual(len(related), 1, f"expected one deduped finding, got: {related}")
+
+    def test_cache_key_finding_downgrades_when_key_function_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture(root, "config/settings.py", """\
+                INSTALLED_APPS = ["django_tenants"]
+                DATABASES = {"default": {"ENGINE": "django_tenants.postgresql_backend"}}
+                CACHES = {
+                    "default": {
+                        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+                        "KEY_FUNCTION": "django_tenants.cache.make_key",
+                    }
+                }
+            """)
+            write_fixture(root, "app/views.py", """\
+                from django.core.cache import cache
+
+
+                def dashboard(request):
+                    cache.set("dashboard_stats", 1)
+            """)
+            _, findings = audit.audit_project(root)
+            cache_findings = [f for f in findings if f.rule == "CACHE-GLOBAL-KEY"]
+            self.assertTrue(cache_findings)
+            self.assertEqual(
+                {f.severity for f in cache_findings}, {"Low"},
+                "KEY_FUNCTION-covered cache keys must not be High findings",
+            )
 
     def test_annotated_queryset_assignment_is_flagged(self):
         rules = self.audit_file("app/typed_api.py", """\

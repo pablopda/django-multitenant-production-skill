@@ -168,8 +168,6 @@ class TenantVocab:
     """Project-specific vocabulary used by the scoping heuristics."""
 
     terms: tuple[str, ...]
-    context_words: tuple[str, ...]
-    scoping_hints: tuple[str, ...]
     field_regex: "re.Pattern[str]"
     context_regex: "re.Pattern[str]"
     scoping_regex: "re.Pattern[str]"
@@ -221,13 +219,6 @@ def read_text(path: Path) -> str:
         return ""
 
 
-def line_at(text: str, line: int) -> str:
-    lines = text.splitlines()
-    if 1 <= line <= len(lines):
-        return lines[line - 1].strip()
-    return ""
-
-
 def dotted_name(node: ast.AST) -> str:
     if isinstance(node, ast.Name):
         return node.id
@@ -267,6 +258,10 @@ def compile_terms_regex(terms: Sequence[str]) -> "re.Pattern[str]":
 
 HIGH_RISK_HINT_REGEX = compile_terms_regex(HIGH_RISK_FILE_HINTS)
 
+# @shared_task, @app.task, @celery_app.task(...), @task — the decorator is the signal
+# that a file defines tasks; importing celery utilities is not.
+TASK_DECORATOR_REGEX = re.compile(r"^\s*@(?:[\w.]+\.)?(?:shared_task|task)\b", re.MULTILINE)
+
 
 def context_window(lines: Sequence[str], lineno: int, radius: int = 8) -> str:
     start = max(0, lineno - 1 - radius)
@@ -289,18 +284,31 @@ def is_migration_file(path: Path, root: Path) -> bool:
 def is_high_risk_file(path: Path, root: Path) -> bool:
     if is_test_file(path, root):
         return False
-    joined = "/".join(rel_parts(path, root))
-    if "management/commands" in joined:
-        return True
+    parts = rel_parts(path, root)
+    joined = "/".join(parts)
     # Boundary-aware match so "therapist.py" does not become high-risk via "api",
     # while "views/detail.py" and "invoice_views.py" still match via "view".
-    return bool(HIGH_RISK_HINT_REGEX.search(joined))
+    if HIGH_RISK_HINT_REGEX.search(joined):
+        return True
+    # Compound names with no separator before the hint ("restapi.py", "myviews.py",
+    # "asynctasks.py"): match a hint at the END of a segment stem, optionally plural.
+    for part in parts:
+        stem = part[:-3] if part.endswith(".py") else part
+        for hint in HIGH_RISK_FILE_HINTS:
+            if stem.endswith(hint) or stem.rstrip("s").endswith(hint):
+                return True
+    return False
 
 
 def looks_like_settings(path: Path, root: Path, text: str) -> bool:
     if path.suffix != ".py":
         return False
     name = path.name.lower()
+    # Settings-shaped files that are explicitly NOT the live settings module must not
+    # satisfy the union presence checks (e.g. an un-merged scaffold snippet would
+    # silence DT-SETTINGS-MISSING for the real settings).
+    if any(marker in name for marker in ("snippet", "example", "sample", "template")):
+        return False
     parts = rel_parts(path, root)
     if name.startswith("settings") or "settings" in parts:
         return True
@@ -358,6 +366,11 @@ def collect_package_facts(root: Path) -> dict[str, str]:
     for path in iter_files(root):
         if path.name not in candidate_names and not is_requirements_file(path, root):
             continue
+        try:
+            if path.stat().st_size > 8_000_000:
+                continue  # pathological lock files
+        except OSError:
+            continue
         text = read_text(path)
         if not text:
             continue
@@ -365,7 +378,7 @@ def collect_package_facts(root: Path) -> dict[str, str]:
         for pkg in interesting:
             if pkg in lower:
                 packages.setdefault(pkg, "present")
-        if is_requirements_file(path, root) or path.name.startswith("requirements"):
+        if is_requirements_file(path, root):
             for line in text.splitlines():
                 parsed = parse_requirements_line(line)
                 if parsed and parsed[0] in interesting:
@@ -399,12 +412,22 @@ def detect_stack(packages: dict[str, str], all_text: str) -> list[str]:
     return stack
 
 
-def resolve_schema_mode(stack: Sequence[str], tenancy: str) -> bool:
-    """True when the ORM heuristics should treat the project as schema-per-tenant."""
+def resolve_schema_mode(stack: Sequence[str], tenancy: str, packages: dict[str, str] | None = None) -> bool:
+    """True when the ORM heuristics should treat the project as schema-per-tenant.
+
+    Declared dependencies outrank text mentions: detect_stack also matches prose
+    (a README comparing django-multitenant would otherwise demote a real
+    django-tenants project to strict shared-schema mode).
+    """
     if tenancy == "schema":
         return True
     if tenancy == "shared":
         return False
+    packages = packages or {}
+    pkg_schema = any(p in packages for p in ("django-tenants", "django-pgschemas", "django-tenant-schemas"))
+    pkg_shared = "django-multitenant" in packages
+    if pkg_schema != pkg_shared:
+        return pkg_schema
     has_schema = any("schema-per-tenant" in s for s in stack)
     has_shared = any("shared schema" in s for s in stack)
     return has_schema and not has_shared
@@ -442,12 +465,39 @@ def build_vocab(terms: Sequence[str]) -> TenantVocab:
     )
     return TenantVocab(
         terms=ordered,
-        context_words=tuple(dict.fromkeys(context)),
-        scoping_hints=scoping,
         field_regex=field_regex,
         context_regex=compile_terms_regex(context),
         scoping_regex=compile_terms_regex(scoping),
     )
+
+
+def _flatten_middleware_value(value: ast.AST) -> list[str] | None:
+    """Flatten a MIDDLEWARE value into entries, or None if the shape is unknown.
+
+    Handles list/tuple literals, `BASE + ["..."]` concatenation, and `[*BASE, "..."]`
+    unpacking. Non-literal segments become a "<dynamic>" placeholder that occupies one
+    position, so the order check degrades conservatively instead of miscounting.
+    """
+    if isinstance(value, (ast.List, ast.Tuple)):
+        entries: list[str] = []
+        for elt in value.elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                entries.append(elt.value)
+            elif isinstance(elt, ast.Starred):
+                inner = _flatten_middleware_value(elt.value)
+                entries.extend(inner if inner is not None else ["<dynamic>"])
+            else:
+                entries.append("<dynamic>")
+        return entries
+    if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
+        left = _flatten_middleware_value(value.left)
+        right = _flatten_middleware_value(value.right)
+        if left is None:
+            left = ["<dynamic>"]
+        if right is None:
+            right = ["<dynamic>"]
+        return left + right
+    return None
 
 
 def extract_middleware_list(text: str) -> tuple[list[str], int] | None:
@@ -469,9 +519,10 @@ def extract_middleware_list(text: str) -> tuple[list[str], int] | None:
         elif isinstance(node, ast.AnnAssign):
             if isinstance(node.target, ast.Name) and node.target.id == "MIDDLEWARE":
                 value = node.value
-        if value is not None and isinstance(value, (ast.List, ast.Tuple)):
-            entries = [elt.value for elt in value.elts if isinstance(elt, ast.Constant) and isinstance(elt.value, str)]
-            return entries, lineno
+        if value is not None:
+            entries = _flatten_middleware_value(value)
+            if entries is not None:
+                return entries, lineno
     return None
 
 
@@ -611,6 +662,7 @@ def audit_python_file(
     findings: list[Finding],
     vocab: TenantVocab,
     schema_per_tenant: bool,
+    tenant_cache_key_fn: bool = False,
 ) -> None:
     rel = relpath(path, root)
     try:
@@ -637,16 +689,26 @@ def audit_python_file(
     migration = is_migration_file(path, root)
     joined_path = "/".join(rel_parts(path, root))
 
-    has_task_marker = "@shared_task" in text or "@app.task" in text or "celery" in lower
+    def line_of(lineno: int) -> str:
+        if 1 <= lineno <= len(lines):
+            return lines[lineno - 1].strip()
+        return ""
+
+    # A file "defines tasks" only when a task decorator is present. A bare substring
+    # match on "celery" flipped request-path views that merely import celery.result
+    # (task-status polling) — or mention celery in a comment — into strict mode.
+    has_task_marker = TASK_DECORATOR_REGEX.search(text) is not None
 
     # SKILL.md code-review heuristics: in schema-per-tenant projects bare ORM lookups are
     # idiomatic inside tenant-request code (search_path is set by the middleware), so the
     # ORM/DRF/get_object_or_404 rules only apply to code that can run outside a tenant
     # request. Shared-schema and unknown stacks keep the strict behavior everywhere.
+    # "signal" is checked against the whole relative path so the standard signals/
+    # package layout (app/signals/handlers.py) is covered, not just signals.py.
     runs_outside_request = (
         migration
         or "management/commands" in joined_path
-        or "signal" in path.name.lower()
+        or "signal" in joined_path
         or has_task_marker
     )
     orm_rules_active = (not schema_per_tenant) or runs_outside_request
@@ -727,7 +789,7 @@ def audit_python_file(
                                     path=rel,
                                     line=getattr(child, "lineno", node.lineno),
                                     message=f"Model `{node.name}` has `unique=True` on a field and appears tenant-owned.",
-                                    evidence=line_at(text, getattr(child, "lineno", node.lineno)),
+                                    evidence=line_of(getattr(child, "lineno", node.lineno)),
                                     recommendation="Ensure uniqueness is scoped per tenant unless the field is intentionally globally unique.",
                                 ))
 
@@ -748,7 +810,7 @@ def audit_python_file(
         def visit_Call(self, node: ast.Call) -> None:
             name = dotted_name(node.func)
             lineno = getattr(node, "lineno", 1)
-            evidence = line_at(text, lineno)
+            evidence = line_of(lineno)
             window = context_window(lines, lineno)
             window_lower = window.lower()
             has_context = bool(vocab.context_regex.search(window))
@@ -878,15 +940,29 @@ def audit_python_file(
                 first_arg = node.args[0] if node.args else None
                 literal = first_arg.value if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str) else None
                 if literal and not vocab.scoping_regex.search(literal):
-                    findings.append(Finding(
-                        severity="High",
-                        rule="CACHE-GLOBAL-KEY",
-                        path=rel,
-                        line=lineno,
-                        message="Cache call uses a static key without tenant/schema hint.",
-                        evidence=evidence,
-                        recommendation="Include tenant/schema in cache keys for tenant-specific data (or set a tenant-aware KEY_FUNCTION), or document that this cache entry is global/public.",
-                    ))
+                    if tenant_cache_key_fn:
+                        # A tenant-aware KEY_FUNCTION prefixes every default-cache call
+                        # (references/03), so a static key is only a residual risk on
+                        # non-default caches.
+                        findings.append(Finding(
+                            severity="Low",
+                            rule="CACHE-GLOBAL-KEY",
+                            path=rel,
+                            line=lineno,
+                            message="Static cache key, but a tenant-aware KEY_FUNCTION is configured.",
+                            evidence=evidence,
+                            recommendation="Verify this call uses the default cache (covered by KEY_FUNCTION). Non-default caches still need tenant-aware keys.",
+                        ))
+                    else:
+                        findings.append(Finding(
+                            severity="High",
+                            rule="CACHE-GLOBAL-KEY",
+                            path=rel,
+                            line=lineno,
+                            message="Cache call uses a static key without tenant/schema hint.",
+                            evidence=evidence,
+                            recommendation="Include tenant/schema in cache keys for tenant-specific data (or set a tenant-aware KEY_FUNCTION), or document that this cache entry is global/public.",
+                        ))
 
             if name.startswith("models."):
                 for kw in node.keywords:
@@ -907,7 +983,7 @@ def audit_python_file(
 
         def _flag_queryset_assignment(self, node: ast.AST, target_names: list[str]) -> None:
             lineno = getattr(node, "lineno", 1)
-            evidence = line_at(text, lineno)
+            evidence = line_of(lineno)
             if orm_rules_active and high_risk and any(t.endswith("queryset") or t == "queryset" for t in target_names):
                 value = getattr(node, "value", None)
                 value_name = dotted_name(value) if value is not None else ""
@@ -999,14 +1075,23 @@ def audit_python_file(
 
 def dedupe_findings(findings: list[Finding]) -> list[Finding]:
     """One defect, one finding: a class-level DRF queryset assignment used to produce
-    DRF-QUERYSET-ASSIGNMENT + DRF-GLOBAL-QUERYSET + ORM-UNSCOPED on the same line."""
-    assignment_lines = {
-        (f.path, f.line) for f in findings if f.rule == "DRF-QUERYSET-ASSIGNMENT"
-    }
+    DRF-QUERYSET-ASSIGNMENT + DRF-GLOBAL-QUERYSET + ORM-UNSCOPED on the same line.
+
+    Matched within a 3-line window, not exact line equality: for a multi-line
+    `queryset = (\n    Model.objects.all()\n)` the Assign node and the Call node
+    report different line numbers.
+    """
+    assignment_lines: dict[str, list[int]] = {}
+    for f in findings:
+        if f.rule == "DRF-QUERYSET-ASSIGNMENT":
+            assignment_lines.setdefault(f.path, []).append(f.line)
     shadowed = {"DRF-GLOBAL-QUERYSET", "ORM-UNSCOPED-HIGH-RISK", "ORM-FILTER-NO-TENANT-HINT"}
     return [
         f for f in findings
-        if not (f.rule in shadowed and (f.path, f.line) in assignment_lines)
+        if not (
+            f.rule in shadowed
+            and any(abs(f.line - line) <= 3 for line in assignment_lines.get(f.path, ()))
+        )
     ]
 
 
@@ -1048,8 +1133,9 @@ def audit_project(
                 settings_entries.append((rel, text))
 
     all_text = "\n".join(all_text_parts)
+    del all_text_parts
     stack = detect_stack(packages, all_text)
-    schema_mode = resolve_schema_mode(stack, tenancy)
+    schema_mode = resolve_schema_mode(stack, tenancy, packages)
 
     if tenant_terms:
         effective_terms: tuple[str, ...] = tuple(dict.fromkeys(t.lower() for t in tenant_terms))
@@ -1059,7 +1145,12 @@ def audit_project(
 
     # Tenant-test detection must honor the configured/inferred vocabulary: a project whose
     # tests create workspace_a/workspace_b is tenant-tested even if it never says "tenant".
-    fixed_test_markers = ("TenantTestCase", "TenantClient", "schema_context", "tenant_context", "for_tenant")
+    # tenant_a/tenant_b stay in the fixed set: the conventional fixture names must be
+    # recognized even when --tenant-term replaces the default vocabulary.
+    fixed_test_markers = (
+        "TenantTestCase", "TenantClient", "schema_context", "tenant_context", "for_tenant",
+        "tenant_a", "tenant_b",
+    )
     term_test_markers = tuple(f"{t}_a" for t in vocab.terms) + tuple(f"{t}_b" for t in vocab.terms)
     tenant_terms_in_tests = any(
         contains_any(text, fixed_test_markers + term_test_markers)
@@ -1067,10 +1158,15 @@ def audit_project(
         for text in test_texts
     )
 
+    combined_settings = "\n".join(text for _, text in settings_entries).lower()
+    tenant_cache_key_fn = (
+        "django_tenants.cache.make_key" in combined_settings or "key_function" in combined_settings
+    )
+
     audit_settings_union(settings_entries, findings)
     for path, text in py_files:
         audit_settings_file(path, root, text, findings)
-        audit_python_file(path, root, text, findings, vocab, schema_mode)
+        audit_python_file(path, root, text, findings, vocab, schema_mode, tenant_cache_key_fn)
 
     if stack and py_count and test_count == 0:
         findings.append(Finding(

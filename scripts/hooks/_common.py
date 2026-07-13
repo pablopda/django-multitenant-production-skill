@@ -9,9 +9,11 @@ Design rules for every hook in this directory:
 
 from __future__ import annotations
 
+import getpass
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -50,13 +52,30 @@ def plugin_root() -> Path:
 
 def data_dir() -> Path:
     env = os.environ.get("CLAUDE_PLUGIN_DATA")
-    base = Path(env) if env else Path(tempfile.gettempdir()) / "claude-dmtp-hook-data"
+    if env:
+        base = Path(env)
+    else:
+        # Per-user fallback: a fixed world-shared /tmp path would collide across users
+        # (second user's writes fail EACCES and silently disable the hooks) and expose
+        # audit evidence to other accounts.
+        try:
+            user = getpass.getuser()
+        except Exception:
+            user = str(os.getuid()) if hasattr(os, "getuid") else "user"
+        base = Path(tempfile.gettempdir()) / f"claude-dmtp-hook-data-{user}"
     base.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(base, 0o700)
+    except OSError:
+        pass
     return base
 
 
 def project_dir(payload: dict) -> Path:
-    for candidate in (payload.get("cwd"), os.environ.get("CLAUDE_PROJECT_DIR")):
+    # CLAUDE_PROJECT_DIR first: it is stable for the whole session, while the payload
+    # cwd drifts with `cd` — a drifted cwd changes the project hash and silently
+    # disarms the baseline-gated hooks.
+    for candidate in (os.environ.get("CLAUDE_PROJECT_DIR"), payload.get("cwd")):
         if candidate:
             return Path(candidate)
     return Path.cwd()
@@ -82,6 +101,34 @@ def finding_key(finding: dict) -> tuple:
     # Line numbers shift on every edit; (path, rule, evidence) survives reflows so a
     # pre-existing finding is not re-reported after unrelated edits to the same file.
     return (finding.get("path"), finding.get("rule"), finding.get("evidence"))
+
+
+def run_audit(project: Path, timeout: int = 25):
+    """Run tenant_static_audit against `project`. Returns (raw_stdout, parsed_report)
+    or None on any failure (missing script, bad exit, timeout, unparseable output)."""
+    audit_script = plugin_root() / "scripts" / "tenant_static_audit.py"
+    if not audit_script.is_file():
+        return None
+    result = subprocess.run(
+        [sys.executable, str(audit_script), "--root", str(project), "--format", "json"],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode not in (0, 1):
+        return None
+    try:
+        return result.stdout, json.loads(result.stdout)
+    except ValueError:
+        return None
+
+
+def write_baseline(project: Path, report: dict) -> None:
+    """Atomically replace the baseline (concurrent hook runs must not interleave)."""
+    path = baseline_path(project)
+    tmp = path.with_suffix(f".tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(report), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def emit(payload: dict) -> None:
